@@ -402,8 +402,8 @@ class MV2DFusion(MVXTwoStageDetector):
                     losses[k] = v.nan_to_num()
         else:
             # 筛选有效样本的特征、图像和元数据，调用ROI Head计算损失
-            import pdb
-            pdb.set_trace()
+            # import pdb
+            # pdb.set_trace()
             losses = self.img_roi_head.forward_train_w_feat(
                 [x[valid_inds] for x in feats], imgs[valid_inds], img_metas_valid, gt_bboxes_valid, gt_labels_valid, )
         return losses
@@ -631,8 +631,8 @@ class MV2DFusion(MVXTwoStageDetector):
                       centers2d=None,
                       **data):
         B, T, V, _, H, W = data['img'].shape
-        import pdb
-        pdb.set_trace()
+        # import pdb
+        # pdb.set_trace()
         # 拆分历史帧（不计算主干网络梯度）和近期帧（计算主干网络梯度）
         prev_img = data['img'][:, :-self.num_frame_backbone_grads]# 历史帧：取前(T - K)帧
         rec_img = data['img'][:, -self.num_frame_backbone_grads:]# 近期帧：取最后K帧（需计算梯度）
