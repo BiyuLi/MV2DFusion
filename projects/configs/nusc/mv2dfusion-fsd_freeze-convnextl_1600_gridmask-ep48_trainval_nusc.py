@@ -589,7 +589,7 @@ ida_aug_conf = {
 }
 
 dataset_type = 'CustomNuScenesDataset'
-data_root = '/home/manager/projects/xzh/MV2DFusion/data/nuscenes/'
+data_root = './data/nuscenes/'
 
 test_pipeline = [
     dict(

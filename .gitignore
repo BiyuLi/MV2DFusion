@@ -1,9 +1,13 @@
 data
 weights
+test
 *.egg-info
 *.egg
 *__pycache__
 *.pth*
+*.png
+*.jpg
+*.gpeg
 work_dirs
 work_dir
 ckpts

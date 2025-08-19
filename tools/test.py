@@ -23,6 +23,11 @@ from projects.mmdet3d_plugin.core.apis.test import custom_multi_gpu_test
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+from pathlib import Path
+import sys
+
+CUR_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(CUR_DIR))
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -237,7 +242,7 @@ def main():
         if not distributed:
             model = MMDataParallel(model, device_ids=[0])
             outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
-            assert False
+            # assert False
         else:
             model = MMDistributedDataParallel(
                 model.cuda(),

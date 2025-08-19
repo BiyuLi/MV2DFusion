@@ -48,8 +48,8 @@ num_epochs = 24
 queue_length = 1
 num_frame_losses = 1
 
-pts_ckpt = '/home/manager/projects/xzh/MV2DFusion/weights/fsdv2-converted.pth'
-img_ckpt = '/home/manager/projects/xzh/MV2DFusion/weights/convnext-l_converted.pth'
+pts_ckpt = 'weights/fsdv2-converted.pth'
+img_ckpt = 'weights/convnext-l_converted.pth'
 
 roi_size = 7
 roi_strides = [4, 8, 16, 32, 64]

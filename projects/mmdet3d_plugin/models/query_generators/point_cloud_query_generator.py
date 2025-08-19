@@ -64,7 +64,8 @@ class PointCloudQueryGenerator(BaseModule):
         scale = 2 * math.pi
         pos = pos * scale
         dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
-        dim_t = 2 * (dim_t // 2) / num_pos_feats + 1
+        # dim_t = 2 * (dim_t // 2) / num_pos_feats + 1
+        dim_t = 2 * torch.div(dim_t, 2, rounding_mode='trunc') / num_pos_feats + 1
         pos_x = pos[..., None] / dim_t
         pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
         return pos_x.flatten(-2)

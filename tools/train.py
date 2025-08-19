@@ -27,6 +27,12 @@ from mmdet.apis import set_random_seed
 from mmseg import __version__ as mmseg_version
 from mmcv.utils import TORCH_VERSION, digit_version
 
+from pathlib import Path
+import sys
+
+CUR_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(CUR_DIR))
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')

@@ -653,7 +653,16 @@ class MV2DFusionHead(AnchorFreeHead):
             spatial_flatten_img.append((H, W))
         feat_flatten_img = torch.cat(feat_flatten_img, dim=1)
         spatial_flatten_img = torch.as_tensor(spatial_flatten_img, dtype=torch.long, device=mlvl_feats[0].device)
-        level_start_index_img = torch.cat((spatial_flatten_img.new_zeros((1, )), spatial_flatten_img.prod(1).cumsum(0)[:-1]))
+        try:
+            level_start_index_img = torch.cat((spatial_flatten_img.new_zeros((1, )), spatial_flatten_img.prod(1).cumsum(0)[:-1]))
+        except RuntimeError:
+            print("CUDA prod操作失败，回退到CPU计算")
+            # cuda对于prod操作有问题，暂时移到CPU上运算
+            spatial_flatten_img_np = spatial_flatten_img.cpu().numpy()
+            spatial_flatten_img_prod = torch.from_numpy(np.prod(spatial_flatten_img_np, axis=1)).to(
+                spatial_flatten_img.device)
+            level_start_index_img = torch.cat(
+                (spatial_flatten_img.new_zeros((1,)), spatial_flatten_img_prod.cumsum(0)[:-1]))
 
         # process point cloud feats
         feat_flatten_pts = self.pts_embed(pts_feat)
