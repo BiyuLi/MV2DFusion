@@ -1,0 +1,10 @@
+data
+weights
+*.egg-info
+*.egg
+*__pycache__
+*.pth*
+work_dirs
+work_dir
+ckpts
+build

@@ -163,19 +163,21 @@ class MV2DFusion(MVXTwoStageDetector):
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
-            img_feats = self.img_backbone(img)
+            img_feats = self.img_backbone(img)# 主干网络输出多尺度特征
             if isinstance(img_feats, dict):
-                img_feats = list(img_feats.values())
+                img_feats = list(img_feats.values())# 若为字典，转换为列表（便于后续处理）
         else:
             return None
         if self.with_img_neck:
-            img_feats = self.img_neck(img_feats)
-        img_feats_det = img_feats
-
+            img_feats = self.img_neck(img_feats)# 颈部网络（FPN）融合特征，将主干输出的多尺度特征融合为统一通道（256 维）的特征图，平衡语义信息和细节信息。
+        img_feats_det = img_feats# 保存融合后的特征，用于后续检测（如RPN、RoI头）
+        # 获取指定层级的特征（self.position_level=2，对应中间层特征）
         BN, C, H, W = img_feats[self.position_level].size()
         if self.training or training_mode:
+            # 训练模式：重塑为 [B, len_queue, N_cam, C, H, W]
             img_feats_reshaped = img_feats[self.position_level].view(B, len_queue, int(BN / B / len_queue), C, H, W)
         else:
+            # 推理模式：无需时序维度，重塑为 [B, N_cam, C, H, W]
             img_feats_reshaped = img_feats[self.position_level].view(B, int(BN / B / len_queue), C, H, W)
         return img_feats_reshaped, img_feats_det
 
@@ -228,33 +230,36 @@ class MV2DFusion(MVXTwoStageDetector):
                               depths=None,
                               gt_bboxes_ignore=None,
                               **data):
-        losses = dict()
-        T = data['img'].size(1)
+        losses = dict() # 存储所有帧的损失
+        T = data['img'].size(1)# 获取时序帧数（data['img']维度通常为[B, T, ...]，T为帧数）
+        # 计算无需计算梯度的帧数和无需返回损失的帧数
         num_nograd_frames = T - self.num_frame_head_grads
         num_grad_losses = T - self.num_frame_losses
-        for i in range(T):
-            requires_grad = False
-            return_losses = False
-            data_t = dict()
-
+        for i in range(T):# 遍历每一帧（i为帧索引，0表示最早帧，T-1表示最新帧）
+            requires_grad = False# 是否计算梯度（默认不计算）
+            return_losses = False# 是否返回损失（默认不返回）
+            data_t = dict()# 存储当前帧i的数据
+            # 1. 提取当前帧i的数据（从多帧数据中拆分）
             for key in data:
                 if key in ['instance_inds_2d', 'points', 'pts_feats']:
-                    data_t[key] = data[key][i]
+                    data_t[key] = data[key][i]# 这些key的数据维度为[B, T, ...]，直接取第i帧
                 elif key in ['proposals']:
-                    data_t[key] = data[key][i]
-                else:
+                    data_t[key] = data[key][i]# 候选框数据取第i帧
+                else:# 其他数据（如图像特征）维度为[B, T, ...]，取第i列（按帧维度索引）
                     data_t[key] = data[key][:, i]
-
-            data_t['img_feats'] = data_t['img_feats']
+            # 2. 处理当前帧的图像特征
+            data_t['img_feats'] = data_t['img_feats']# 从当前帧数据中提取图像特征
+            # 3. 决定是否计算梯度（仅最新的self.num_frame_head_grads帧计算）
             if i >= num_nograd_frames:
                 requires_grad = True
             if i >= num_grad_losses:
                 return_losses = True
+            # 5. 调用点云训练前向函数，计算当前帧的损失
             loss = self.forward_pts_train(gt_bboxes_3d[i],
                                           gt_labels_3d[i], gt_bboxes[i],
                                           gt_labels[i], img_metas[i], centers2d[i], depths[i],
                                           requires_grad=requires_grad, return_losses=return_losses, **data_t)
-            if loss is not None:
+            if loss is not None:# 6. 收集损失（仅当return_losses=True时有效）
                 for key, value in loss.items():
                     losses['frame_' + str(i) + "_" + key] = value
         return losses
@@ -272,23 +277,24 @@ class MV2DFusion(MVXTwoStageDetector):
         for b in range(B):
             for v in range(V):
                 img_meta = {
-                    'img_shape': img_metas[b]['img_shape'][v],
-                    'ori_shape': img_metas[b]['ori_shape'][:3],
-                    'pad_shape': img_metas[b]['pad_shape'][v],
-                    'batch_input_shape': (H, W),
-                    'scale_factor': img_metas[b]['scale_factor'],
-                    'intrinsics': data['intrinsics'][b][v],
-                    'extrinsics': data['extrinsics'][b][v],
-                    'lidar2img': data['lidar2img'][b][v],
-                    'num_views': V,
+                    'img_shape': img_metas[b]['img_shape'][v],# 当前视图预处理后的形状
+                    'ori_shape': img_metas[b]['ori_shape'][:3],# 原始图像的形状（取前3维，可能含通道）
+                    'pad_shape': img_metas[b]['pad_shape'][v],# 填充后的形状（预处理时可能补边）
+                    'batch_input_shape': (H, W),# 批量输入的统一形状（高、宽）
+                    'scale_factor': img_metas[b]['scale_factor'],# 图像缩放因子（原始到预处理的缩放比例）
+                    'intrinsics': data['intrinsics'][b][v],# 相机内参矩阵（用于3D到2D投影）
+                    'extrinsics': data['extrinsics'][b][v],# 相机外参矩阵（用于坐标系转换）
+                    'lidar2img': data['lidar2img'][b][v],# 激光雷达到图像的转换矩阵（融合点云与图像时用）
+                    'num_views': V,# 总视图数量（当前样本的视图数）
                     # for debug
                     # 'img': ori_imgs[b, v],
                     # 'img_norm_cfg': img_metas[b]['img_norm_cfg'],
                     # 'scene_token': img_metas[b]['scene_token'],
                     # 'filename': img_metas[b]['filename'][v],
                 }
-
+                # 添加前一帧存在标志（可能用于时序模型）
                 img_meta['prev_exists'] = data['prev_exists'][b].clone()
+                # 训练时添加标注信息（监督信号）
                 if self.training:
                     if 'instance_inds_2d' in data:
                         instance_inds_2d = data['instance_inds_2d'][b][v].clone()
@@ -304,12 +310,12 @@ class MV2DFusion(MVXTwoStageDetector):
         if len(labels) == 0:
             return boxes, labels.long()
 
-        b_tensor = boxes.tensor.clone()
+        b_tensor = boxes.tensor.clone()# 复制边界框的 tensor 数据（避免修改原始数据）
         if b_tensor.size(1) == 9:
-            vel = b_tensor[:, -2:]
-            b_tensor = b_tensor[:, :-2]
+            vel = b_tensor[:, -2:]# 若边界框有9个参数，最后2个视为速度信息（vel）
+            b_tensor = b_tensor[:, :-2]# 分离出核心边界框参数（前7个）
         else:
-            vel = None
+            vel = None# 无速度信息时为 None
 
         if self.dataset == 'nuscenes':
             tgt_cls = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -331,22 +337,31 @@ class MV2DFusion(MVXTwoStageDetector):
         else:
             raise NotImplementedError
 
-        tgt_cls = [x.lower() for x in tgt_cls]
-        fsd_cls = [x.lower() for x in fsd_cls]
-
+        tgt_cls = [x.lower() for x in tgt_cls] # 原始类别名称转为小写（避免大小写匹配问题）
+        fsd_cls = [x.lower() for x in fsd_cls]# FSD 类别名称转为小写
+        # 创建“原始类别 -> FSD 类别”的索引映射表
         to_fsd_cls_map = [fsd_cls.index(x) for x in tgt_cls]
+        # 创建“FSD 类别 -> 原始类别”的索引映射表（用于反向转换）
         to_tgt_cls_map = [tgt_cls.index(x) for x in fsd_cls]
         if not inv:
+            # 正向转换（原始 -> FSD）
+            # 调整角度参数（第6列，可能是3D框的朝向角）
             b_tensor[:, 6] = -b_tensor[:, 6] - np.pi / 2
+            # 选择“原始 -> FSD”的类别映射表
             cls_map = labels.new_tensor(to_fsd_cls_map)
+            # 重排边界框参数的列顺序（可能对应不同格式的参数定义）
             b_tensor = b_tensor[:, [0, 1, 2, 4, 3, 5, 6]]
         else:
+            # 反向转换（FSD -> 原始）
             b_tensor[:, 6] = -(b_tensor[:, 6] + np.pi / 2)
             cls_map = labels.new_tensor(to_tgt_cls_map)
             b_tensor = b_tensor[:, [0, 1, 2, 4, 3, 5, 6]]
         if vel is not None:
+             # 若有速度信息，将其拼接回边界框 tensor（保持9个参数）
             b_tensor = torch.cat([b_tensor, vel], dim=1)
+        # 重构 boxes 对象（保持原 boxes 类的属性和方法）
         boxes = boxes.__class__(b_tensor, box_dim=b_tensor.size(-1))
+        # 映射类别标签（通过映射表转换索引）
         labels = cls_map[labels]
         return boxes, labels
 
@@ -359,10 +374,11 @@ class MV2DFusion(MVXTwoStageDetector):
     @auto_fp16(apply_to=('imgs', 'feats'))
     def forward_roi_head_train(self, imgs, feats, img_metas, gt_bboxes, gt_labels):
         # TODO: check 2d annotation
-        gt_bboxes = sum(gt_bboxes, [])
+        gt_bboxes = sum(gt_bboxes, [])#统一不同批次 / 视图的标注格式，便于后续逐样本处理。
         gt_labels = sum(gt_labels, [])
         valid_inds = imgs.new_zeros(len(gt_bboxes), dtype=torch.bool)
         gt_bboxes_valid, gt_labels_valid, img_metas_valid = [], [], []
+        #用于存储筛选后的有效标注（gt_bboxes_valid、gt_labels_valid）和对应的图像元数据（img_metas_valid）
         for i in range(len(gt_bboxes)):
             if len(gt_bboxes[i]) > 0:
                 gt_bboxes_valid.append(gt_bboxes[i])
@@ -370,18 +386,24 @@ class MV2DFusion(MVXTwoStageDetector):
                 img_metas_valid.append(img_metas[i])
                 valid_inds[i] = 1
 
-        if not valid_inds.any():
+        if not valid_inds.any():# 当所有样本都无有效标注时
             # grad for all parameters
-            gt_bboxes_valid = [imgs.new_tensor([[40, 120, 40, 120]])]
-            gt_labels_valid = [imgs.new_tensor([0], dtype=torch.int64)]
+            # 手动创建虚拟标注（避免训练中断）
+            gt_bboxes_valid = [imgs.new_tensor([[40, 120, 40, 120]])]# 虚拟边界框（坐标示例）
+            gt_labels_valid = [imgs.new_tensor([0], dtype=torch.int64)] # 虚拟标签（类别0）
+            # 调用ROI Head的训练接口，但仅使用第一个样本的特征和图像
             losses = self.img_roi_head.forward_train_w_feat(
                 [x[:1] for x in feats], imgs[:1], img_metas[:1], gt_bboxes_valid, gt_labels_valid, )
+             # 将所有损失值清零（虚拟标注不贡献梯度）
             losses = {k: ([x * 0 for x in v] if isinstance(v, (list, tuple)) else v * 0) for k, v in losses.items()}
-
+            # 处理可能的NaN值（替换为0，保证训练稳定）
             for k, v in losses.items():
                 if isinstance(v, torch.Tensor) and v.isnan().any():
                     losses[k] = v.nan_to_num()
         else:
+            # 筛选有效样本的特征、图像和元数据，调用ROI Head计算损失
+            import pdb
+            pdb.set_trace()
             losses = self.img_roi_head.forward_train_w_feat(
                 [x[valid_inds] for x in feats], imgs[valid_inds], img_metas_valid, gt_bboxes_valid, gt_labels_valid, )
         return losses
@@ -407,28 +429,29 @@ class MV2DFusion(MVXTwoStageDetector):
             [bboxes.to(device), torch.ones([len(labels), 1], dtype=bboxes.dtype, device=device),
              labels.unsqueeze(-1).to(bboxes.dtype)], dim=-1).to(device)
                 for bboxes, labels in zip(gt_bboxes, gt_labels)]
-
+    #核心功能是将检测结果中未覆盖到的真值框（ground truth boxes）补充到检测结果中，
+    # 确保最终结果既包含模型预测的检测框，也包含那些未被检测到但确实存在的真实目标框。
     def complement_2d_gt(self, detections, gts, thr=0.6, with_id=False):
         # detections: [n, 6], gts: [m, 6]
         if len(detections) == 0:
             if len(gts) == 0:
-                gts = gts.new_zeros([0, 6])
-            if with_id:
+                gts = gts.new_zeros([0, 6]) # 若真值也为空，返回空tensor
+            if with_id:# 若需要ID，给真值框增加一列ID（值为-1，通常表示无跟踪ID）
                 gts = torch.cat([gts, torch.zeros_like(gts[..., :1]) - 1], dim=-1)
-            return gts
+            return gts # 检测结果为空时，直接返回真值框（作为补充）
         if len(gts) == 0:
-            return detections
-        iou = self.box_iou(gts, detections)
-        max_iou = iou.max(-1)[0]
-        complement_ids = max_iou <= thr
+            return detections# 无真值框时，直接返回检测结果（无需补充）
+        iou = self.box_iou(gts, detections)# 计算真值框与检测框的IOU，形状为 [m, n]
+        max_iou = iou.max(-1)[0] # 对每个真值框，取与所有检测框的最大IOU，形状为 [m,]
+        complement_ids = max_iou <= thr# 筛选出最大IOU ≤ 阈值的真值框（未被检测覆盖）
         min_bbox_size = self.img_roi_head.test_cfg.get('min_bbox_size', 0)
         wh = gts[:, 2:4] - gts[:, 0:2]
-        valid_ids = (wh >= min_bbox_size).all(dim=1)
-        complement_gts = gts[complement_ids & valid_ids]
+        valid_ids = (wh >= min_bbox_size).all(dim=1) # 筛选宽和高均 ≥ 最小尺寸的真值框
+        complement_gts = gts[complement_ids & valid_ids]# 同时满足“未被覆盖”和“尺寸有效”的真值框
         if with_id:
             complement_gts = torch.cat([complement_gts, torch.zeros_like(complement_gts[..., :1]) - 1], dim=-1)
         return torch.cat([detections, complement_gts], dim=0)
-
+    #主要功能是将检测结果从 “按类别分组” 的格式转换为 “按目标实例” 的格式，并过滤掉过小的边界框，以便后续处理（如 3D 检测或跟踪）。
     def process_2d_detections(self, results, device):
         """
         :param results:
@@ -445,6 +468,7 @@ class MV2DFusion(MVXTwoStageDetector):
                 # if len(boxes) > 0 else torch.zeros((0, 6), device=device)
                 for label_id, boxes in enumerate(res)], dim=0) for res in results]
         min_bbox_size = self.img_roi_head.test_cfg.get('min_bbox_size', 0)
+        #过滤过小的边界框
         if min_bbox_size > 0:
             new_detections = []
             for det in detections:
@@ -482,38 +506,41 @@ class MV2DFusion(MVXTwoStageDetector):
             raise NotImplementedError
         else:
             # image query generation
-            if self.with_img_roi_head:
+            if self.with_img_roi_head:#2D 检测头前向传播
                 losses_det2d = self.forward_roi_head_train(imgs_det, feats_det, img_metas_det, gt_bboxes, gt_labels)
 
             self.eval()
             with torch.no_grad():
+                #生成 2D 检测结果dets（候选框）
                 dets2d, dets = self.forward_roi_head(imgs_det, feats_det, img_metas_det)
+                #处理 2D 真实标注，得到dets_gt（用于补充检测结果）
                 dets_gt = self.process_2d_gt(sum(gt_bboxes, []), sum(gt_labels, []), imgs_det.device)
                 assert len(dets) == (len(dets_gt))
                 if self.use_2d_proposal:
                     dets = sum([x for x in data['proposals']], [])
-                dets = [self.complement_2d_gt(det, det_gt, )
+                dets = [self.complement_2d_gt(det, det_gt, )#将真实标注补充到检测结果中（可能用于提升训练稳定性）
                         for det, det_gt in zip(dets, dets_gt)]
 
-                # prevent empty detection during training
+                #防止检测结果为空：若dets为空，手动添加一个虚拟候选框
                 if sum([len(p) for p in dets]) == 0:
                     proposal = torch.tensor([[10, 20, 30, 40, 0, 1]], dtype=dets[0].dtype, device=dets[0].device)
                     dets = [proposal] + dets[1:]
-
+                #将边界框（dets）转换为 ROI（Region of Interest）格式，便于后续提取 ROI 特征。
                 rois = bbox2roi(dets)
             self.train()
-
+            #从图像特征（feats_det）中提取 ROI 区域的特征（roi_feats）
             roi_feats = self.extract_roi_feats(feats_det, rois, **data)
+            #计算每个视角 / 每个样本的 ROI 数量（n_rois_per_view/n_rois_per_batch），用于特征分组
             n_rois_per_view = [len(p) for p in dets]
             n_rois_per_batch = [sum(n_rois_per_view[i * V: (i + 1) * V]) for i in range(B)]
-
+            #基于 ROI 特征生成动态查询（dyn_query）和辅助特征（dyn_feats），这些查询将用于后续与点云特征的融合
             dyn_query, dyn_feats = self.img_query_generator(roi_feats, dets, img_metas_det,
                                                             n_rois_per_view=n_rois_per_view,
                                                             n_rois_per_batch=n_rois_per_batch,
                                                             data=data)
             dyn_feats_pred = dyn_feats
 
-            if self.gt_mono_loss:
+            if self.gt_mono_loss:# 单目深度损失处理
                 rois_gt = bbox2roi(dets_gt)
                 roi_feats_gt = self.extract_roi_feats(feats_det, rois_gt, **data)
                 n_rois_per_view_gt = [len(p) for p in dets_gt]
@@ -525,12 +552,15 @@ class MV2DFusion(MVXTwoStageDetector):
                 n_rois_per_batch = n_rois_per_batch_gt
 
             # lidar query generation
+            # 转换3D标注为FSDet格式
             fsd_gt_bboxes_3d, fsd_gt_labels_3d = [], []
             for b in range(B):
                 box, label = self.convert_to_fsd_anno(gt_bboxes_3d[b], gt_labels_3d[b])
                 fsd_gt_bboxes_3d.append(box)
                 fsd_gt_labels_3d.append(label)
+            # 点云 backbone 前向传播
             out_dict = self.pts_backbone.forward_train(data['pts_feats'], img_metas, fsd_gt_bboxes_3d, fsd_gt_labels_3d)
+            # 生成点云查询特征
             pts_feat, pts_pos, pts_query_feat, pts_query_center = self.pts_query_generator(
                 out_dict['voxel_feats'], out_dict['voxel_coors'], out_dict['voxel_xyz'], out_dict['query_feats'],
                 out_dict['query_xyz'], out_dict['query_pred'], out_dict['query_cat'], B)
@@ -601,26 +631,30 @@ class MV2DFusion(MVXTwoStageDetector):
                       centers2d=None,
                       **data):
         B, T, V, _, H, W = data['img'].shape
-
-        prev_img = data['img'][:, :-self.num_frame_backbone_grads]
-        rec_img = data['img'][:, -self.num_frame_backbone_grads:]
+        import pdb
+        pdb.set_trace()
+        # 拆分历史帧（不计算主干网络梯度）和近期帧（计算主干网络梯度）
+        prev_img = data['img'][:, :-self.num_frame_backbone_grads]# 历史帧：取前(T - K)帧
+        rec_img = data['img'][:, -self.num_frame_backbone_grads:]# 近期帧：取最后K帧（需计算梯度）
+        
         rec_img_feats, rec_img_feats_for_det = self.extract_img_feat(rec_img, self.num_frame_backbone_grads)
-
+        # 若存在历史帧（T - K > 0），则提取其特征
         if T - self.num_frame_backbone_grads > 0:
-            self.eval()
-            with torch.no_grad():
+            self.eval()# 模型设为推理模式（关闭BN层更新、Dropout等）
+            with torch.no_grad():# 禁用梯度计算（历史帧不参与参数更新）
                 prev_img_feats, prev_img_feats_for_det = self.extract_img_feat(prev_img,
                                                                                T - self.num_frame_backbone_grads, True)
-            self.train()
+            self.train() # 恢复训练模式（仅影响后续操作）
             data['img_feats'] = torch.cat([prev_img_feats, rec_img_feats], dim=1)
-
+            # 处理用于检测头的多尺度特征（按尺度分别拼接）
             prev_T = T - self.num_frame_backbone_grads
             rec_T = self.num_frame_backbone_grads
-            data['img_feats_for_det'] = [
+            data['img_feats_for_det'] = [# 每个尺度的特征：拼接历史帧和近期帧（维度调整为[B, T, V, C, H, W]）
                 torch.cat([prev.view(B, prev_T, V, *prev.shape[1:]), rec.view(B, rec_T, V, *rec.shape[1:])], dim=1)
                 for prev, rec in zip(prev_img_feats_for_det, rec_img_feats_for_det)]
-            data['img_feats_for_det'] = GroupedItems(data['img_feats_for_det'])
+            data['img_feats_for_det'] = GroupedItems(data['img_feats_for_det'])# 封装为GroupedItems（方便多尺度特征处理）
         else:
+            # 若没有历史帧（T <= K），直接使用近期帧特征
             data['img_feats'] = rec_img_feats
             data['img_feats_for_det'] = GroupedItems([x.view(B, T, V, *x.shape[1:]) for x in rec_img_feats_for_det])
         data['pts_feats'] = data['points']

@@ -129,13 +129,13 @@ class SingleStageFSDV2(SingleStage3DDetector):
         device = points.device
         voxel_size = torch.tensor(self.virtual_voxel_size, device=device)
         pc_range = torch.tensor(self.point_cloud_range, device=device)
-
+        # 计算体素坐标（xyz 到体素索引的转换）
         res_coors = torch.div(points[:, :3] - pc_range[None, :3], voxel_size[None, :], rounding_mode='floor').long()
         res_coors = res_coors[:, [2, 1, 0]] # to zyx order
 
         coors_batch = torch.cat([batch_idx[:, None], res_coors], dim=1)
 
-        return coors_batch
+        return coors_batch#【N, 4】
 
     def clip_points(self, points, pc_range):
         eps = 1e-5
@@ -169,82 +169,91 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
         else:
             raise NotImplementedError
-
+# 主要功能是融合原始点云特征与通过采样得到的 “虚拟点”（预测的目标中心）特征，
+# 经过体素化、编码和 backbone 处理后，提取用于后续检测任务的有效特征
     def extract_feat(self, sampled_dict, origin_dict, gt_bboxes_3d=None, multiscale_features=None):
         """Extract features from points."""
         if self.baseline_mode:
             return self.extract_feat_baseline(sampled_dict, origin_dict, gt_bboxes_3d, multiscale_features)
 
-        sampled_pts = sampled_dict['seg_points']
-        sampled_centers = sampled_dict['center_preds']
-        sampled_logits = sampled_dict['seg_logits']
-        sampled_feats = sampled_dict['seg_feats']
-        sampled_batch_idx = sampled_dict['batch_idx']
+        sampled_pts = sampled_dict['seg_points']# 采样点的坐标
+        sampled_centers = sampled_dict['center_preds']# 预测的目标中心（虚拟点）
+        sampled_logits = sampled_dict['seg_logits']# 采样点的分割logits
+        sampled_feats = sampled_dict['seg_feats']# 采样点的特征
+        sampled_batch_idx = sampled_dict['batch_idx']# 采样点所属的batch索引
         device = sampled_pts.device
 
-        # the predicted centers might be out-of-range
+        # 裁剪预测中心到点云有效范围内（防止超出边界）
         sampled_centers = self.clip_points(sampled_centers, self.point_cloud_range)
         # sampled_centers
-
+        # 计算虚拟点与采样点的偏移量（归一化）
         offset = (sampled_centers - sampled_pts[:, :3]) / 10 # hardcode a normalizer
+        # 拼接特征：采样点特征 + 偏移量 + 分割logits + 采样点的额外特征（如强度，第3列及以后）
         proj_input = torch.cat([sampled_feats, offset, sampled_logits, sampled_pts[:, 3:]], 1)
-        vir_pts_feat = self.virtual_proj(proj_input)
+        vir_pts_feat = self.virtual_proj(proj_input)# 通过虚拟投影层（virtual_proj）生成虚拟点特征
 
-        if self.zero_virtual_feature:
+        if self.zero_virtual_feature:# 若启用，则将虚拟点特征置零（用于消融实验，验证虚拟点的作用）
             vir_pts_feat = vir_pts_feat * 0
-
-        ori_pts = origin_dict['seg_points']
-        ori_batch_idx = origin_dict['batch_idx']
-        ori_pts_feat = origin_dict['seg_feats']
+        # 从原始字典中提取关键数据
+        ori_pts = origin_dict['seg_points']# 原始点坐标及特征
+        ori_batch_idx = origin_dict['batch_idx']# 原始点所属的batch索引
+        ori_pts_feat = origin_dict['seg_feats'] # 原始点特征
+        # 通过原始投影层（ori_proj）处理原始点特征（可能是维度调整或特征增强）
         ori_pts_feat = self.ori_proj(ori_pts_feat)
-
+        # 合并坐标：原始点的x/y/z + 虚拟点（预测中心）的x/y/z
         cat_pts = torch.cat([ori_pts[:, :3], sampled_centers], 0)
+        # 合并特征：原始点特征 + 虚拟点特征
         cat_feat = torch.cat([ori_pts_feat, vir_pts_feat], 0)
+        # 合并batch索引：原始点的batch索引 + 虚拟点的batch索引
         cat_batch_idx = torch.cat([ori_batch_idx, sampled_batch_idx], 0)
-
+        # 对合并后的点进行体素化，得到每个点所属的体素坐标（coors）
         coors = self.voxelize_with_batch_idx(cat_pts, cat_batch_idx)
-
+        # 拼接坐标和特征，作为体素编码器的输入
         voxel_encoder_input = torch.cat([cat_pts, cat_feat], 1)
+        # 体素编码：将同一体素内的点特征聚合为体素特征
         voxel_feats, voxel_coors, unq_inv = self.voxel_encoder(voxel_encoder_input, coors, return_inv=True)
-
+        # 生成点类型指示符：0表示原始点，1表示虚拟点
         pts_indicators = torch.cat(
             [
                 torch.zeros(len(ori_pts), device=device, dtype=torch.float),
                 torch.ones( len(sampled_centers), device=device, dtype=torch.float)
             ]
         )
+        # 聚合体素内的指示符（平均），得到体素是否包含虚拟点的标记
         voxel_indicators, scatter_coors = scatter_v2(pts_indicators, coors, mode='avg', return_inv=False)
-        assert (scatter_coors == voxel_coors).all()
+        assert (scatter_coors == voxel_coors).all()# 确保聚合后的坐标与体素坐标一致
+        # 虚拟体素掩码：指示符>0的体素（至少包含一个虚拟点）
         virtual_mask = voxel_indicators > 0
 
-        batch_size = voxel_coors[:, 0].max().item() + 1
-
+        batch_size = voxel_coors[:, 0].max().item() + 1 # batch大小
+        # 若提供多尺度特征，则进行融合（提升特征表达能力）
         if multiscale_features is not None:
             voxel_feats, voxel_coors, singlescale_mask = self.multiscale_fusion(multiscale_features, voxel_feats, voxel_coors)
 
-        if self.only_virtual:
+        if self.only_virtual:# 若仅使用虚拟体素，则过滤掉不含虚拟点的体素
             assert multiscale_features is None
             voxel_feats = voxel_feats[virtual_mask]
             voxel_coors = voxel_coors[virtual_mask]
-
+        # 通过backbone网络（如3D CNN）处理体素特征，得到高层特征
         out_voxel_feats, out_coors, sparse_shape = self.backbone(voxel_feats, voxel_coors, batch_size)
-
+        # 若使用多尺度特征，根据掩码筛选最终特征
         if multiscale_features is not None:
             out_voxel_feats = out_voxel_feats[singlescale_mask]
             out_coors = out_coors[singlescale_mask]
-            voxel_coors = voxel_coors[singlescale_mask] # in fact, out_coors and voxel_coors are same
+            voxel_coors = voxel_coors[singlescale_mask] # in fact, out_coors and voxel_coors are same # 确保坐标一致
 
-        # get voxel center xyz
+        # get voxel center xyz# 体素大小和点云范围（预设参数）
         voxel_size = torch.tensor(self.virtual_voxel_size, device=device) # correct only if is_same 
         pc_range = torch.tensor(self.point_cloud_range, device=device)
+        # 计算每个体素的中心坐标：体素坐标→实际3D坐标（加0.5*体素大小表示中心）
         voxel_centers = (out_coors[:, [3, 2, 1]] + 0.5) * voxel_size[None, :] + pc_range[None, :3]
-
+        # 输出体素特征、坐标、中心
         out_voxel_dict = {
             'out_voxel_feats': out_voxel_feats,
             'out_coors': out_coors,
             'out_centers': voxel_centers,
         }
-
+        # 提取虚拟体素的特征、坐标、中心（根据是否仅使用虚拟体素）
         if self.only_virtual:
             virtual_voxel_feats = out_voxel_feats
             virtual_coors = out_coors
@@ -253,41 +262,48 @@ class SingleStageFSDV2(SingleStage3DDetector):
             virtual_voxel_feats = out_voxel_feats[virtual_mask]
             virtual_coors = out_coors[virtual_mask]
             virtual_centers = voxel_centers[virtual_mask]
-
-        out_dict = dict(
+        # 基础输出字典：包含虚拟体素特征及相关信息
+        out_dict = dict(    
             virtual_feats=virtual_voxel_feats,
             virtual_coors=virtual_coors,
             virtual_centers=virtual_centers,
             # voxel_indicators=voxel_indicators
-            sparse_shape=sparse_shape,
+            sparse_shape=sparse_shape,# 体素网格的稀疏形状
         )
-        out_dict.update(out_voxel_dict)
+        out_dict.update(out_voxel_dict)# 合并体素特征信息
 
         if self.training:
+            # 记录虚拟体素数量（用于监控）
             self.print_info['num_virtual'] = virtual_voxel_feats.new_ones(1) * len(virtual_voxel_feats)
-
+            # 计算体素质心（结合真实框的加权质心或平均质心）
             alpha = self.train_cfg.get('centroid_alpha', None)
             if alpha is not None:
+                # 计算真实框内的点掩码（用于加权）
                 gt_fg_mask = self.get_batched_gt_fg_mask(cat_pts[:, :3], cat_batch_idx, gt_bboxes_3d)
+                # 生成权重：真实前景点权重为1，背景点权重为alpha（平衡权重）
                 alpha_mask = (~gt_fg_mask).float() * alpha + gt_fg_mask.float()
+                 # 加权求和计算体素质心（坐标×权重后求和，再除以权重和）
                 sum_centroid, _ = scatter_v2(alpha_mask[:, None] * cat_pts[:, :3], coors, mode='sum', return_inv=False)
                 sum_alpha, _ = scatter_v2(alpha_mask[:, None], coors, mode='sum', return_inv=False)
-                assert (sum_alpha >= alpha).all()
+                assert (sum_alpha >= alpha).all()# 确保权重和有效
                 voxel_centroid = sum_centroid / sum_alpha
             else:
+                 # 简单平均计算体素质心
                 voxel_centroid, _ = scatter_v2(cat_pts[:, :3], coors, mode='avg', return_inv=False)
-
+            # 仅保留虚拟体素的质心
             voxel_centroid = voxel_centroid[virtual_mask]
             out_dict['virtual_centroid'] = voxel_centroid
+            # 断言：质心必须在体素范围内（误差允许范围内）
             assert ((voxel_centroid - virtual_centers).abs() < voxel_size / 2 + 1e-3).all()
 
         if self.as_rpn:
-            # need pts information for GroupCorrection
+            # need pts information for GroupCorrection# 从体素特征恢复点特征（供GroupCorrection等模块使用）
             out_pts_feats = self.recover_point_features(out_voxel_feats, out_coors, sparse_shape, cat_pts, cat_batch_idx, voxel_coors, unq_inv)
-            out_dict['pts_feats'] = out_pts_feats
-            out_dict['pts_xyz'] = cat_pts
-            out_dict['pts_indicators'] = pts_indicators
-            out_dict['pts_batch_inds'] = cat_batch_idx
+            # 补充点相关信息到输出字典
+            out_dict['pts_feats'] = out_pts_feats# 恢复的点特征
+            out_dict['pts_xyz'] = cat_pts# 合并后的点坐标
+            out_dict['pts_indicators'] = pts_indicators# 点类型指示符（原始/虚拟）
+            out_dict['pts_batch_inds'] = cat_batch_idx# 点的batch索引
 
         return out_dict
 
@@ -396,24 +412,31 @@ class SingleStageFSDV2(SingleStage3DDetector):
     def multiscale_fusion(self, ms_data, voxel_feats, coors):
 
         cfg = self.multiscale_cfg
-
+        # 从多尺度数据中筛选配置指定的层级（0，1，2）
         ms_data = [ms_data[l] for l in cfg['multiscale_levels']]
+        # 对每个尺度的特征进行投影，转换为可融合的维度
         ms_feats = [ self.ms_projectors[i](ms_data[i].features) for i in range(len(ms_data)) ]
+        # 对每个尺度的坐标进行投影，转换为与原始体素坐标一致的格式
         ms_coors = [ self.ms_coors_proj(data.indices, data.spatial_shape) for data in ms_data]
-
+        # 计算多尺度特征的总数量（用于生成指示符）
         num_add_feats = sum([len(f) for f in ms_feats])
-
+        # 拼接特征：原始体素特征 + 所有多尺度特征（按第0维拼接）
         cat_feats = torch.cat([voxel_feats,] + ms_feats, 0)
+        # 拼接坐标：原始体素坐标 + 所有多尺度特征的坐标（确保特征与坐标一一对应）
         cat_coors = torch.cat([coors,] + ms_coors, 0)
+        # 生成指示符：原始体素特征标记为1，多尺度新增特征标记为0
         indicators = torch.cat([voxel_feats.new_ones(len(voxel_feats), 1), voxel_feats.new_zeros(num_add_feats, 1)], 0)
-
+        # 按坐标聚合所有特征（原始+多尺度），融合模式由配置指定（如平均、最大）
         out_feats, out_coors = scatter_v2(cat_feats, cat_coors, mode=cfg['fusion_mode'], return_inv=False)
+        # 按坐标聚合指示符（取最大值），标记每个坐标是否包含原始体素特征
         out_indicators, _ = scatter_v2(indicators, cat_coors, mode='max', return_inv=False)
-        out_indicators = out_indicators.squeeze()
-
+        out_indicators = out_indicators.squeeze()# 去除多余维度（形状从[N,1]变为[N]）
+        # 掩码：只保留包含原始体素特征的坐标（指示符为1）
         singlescale_mask = out_indicators == 1
-        assert singlescale_mask.sum() == len(voxel_feats)
-
+        assert singlescale_mask.sum() == len(voxel_feats)# 断言：原始体素数量与掩码保留的数量一致，确保无丢失
+        #融合后的特征（原始体素特征 + 多尺度特征按坐标聚合的结果）
+        #融合后特征对应的坐标
+        #标记融合特征中属于原始体素的掩码
         return out_feats, out_coors, singlescale_mask
 
     def ms_coors_proj(self, coors, sparse_shape):
@@ -463,50 +486,56 @@ class SingleStageFSDV2(SingleStage3DDetector):
                       runtime_info=None):
         if runtime_info is not None:
             self.runtime_info = runtime_info # stupid way to get arguements from children class
+        import pdb
+        pdb.set_trace()
         losses = {}
+        # 过滤掉标签无效的真值框和标签（仅保留 l >= 0 的标注）
         gt_bboxes_3d = [b[l>=0] for b, l in zip(gt_bboxes_3d, gt_labels_3d)]
         gt_labels_3d = [l[l>=0] for l in gt_labels_3d]
 
-        bsz = len(points)
-
+        bsz = len(points)# 获取批次大小（B）
+        # 调用分割器处理点云，传入点云、元数据、真值框和标签，as_subsegmentor=True表示作为子模块运行
         seg_out_dict = self.segmentor(points=points, img_metas=img_metas, gt_bboxes_3d=gt_bboxes_3d, gt_labels_3d=gt_labels_3d, as_subsegmentor=True)
-
+        # 提取分割特征
         seg_feats = seg_out_dict['seg_feats']
+        # 若配置了detach_segmentor，将分割特征detach（切断梯度回传）
         if self.train_cfg.get('detach_segmentor', False):
             seg_feats = seg_feats.detach()
-        seg_loss = seg_out_dict['losses']
-        losses.update(seg_loss)
+        seg_loss = seg_out_dict['losses']# 提取分割损失
+        losses.update(seg_loss)# 将分割损失合并到总损失中
 
         dict_to_sample = dict(
-            seg_points=seg_out_dict['seg_points'],
-            seg_logits=seg_out_dict['seg_logits'].detach(),
-            seg_vote_preds=seg_out_dict['seg_vote_preds'].detach(),
-            seg_feats=seg_feats,
-            batch_idx=seg_out_dict['batch_idx'],
-            vote_offsets=seg_out_dict['offsets'].detach(),
+            seg_points=seg_out_dict['seg_points'],# 分割后的点云
+            seg_logits=seg_out_dict['seg_logits'].detach(),# 分割logits（detach避免梯度影响）
+            seg_vote_preds=seg_out_dict['seg_vote_preds'].detach(),# 投票预测（detach）
+            seg_feats=seg_feats,# 分割特征
+            batch_idx=seg_out_dict['batch_idx'], # 点的批次索引
+            vote_offsets=seg_out_dict['offsets'].detach(),# 投票偏移（detach）
         )
-
+        # 调用采样方法（sample/batched_group_sample等），按类别/组采样前景点
         sampled_out = self.sample(dict_to_sample, dict_to_sample['vote_offsets'], gt_bboxes_3d, gt_labels_3d) # per cls list in sampled_out
-
+        # 合并不同类别/组的采样数据（如点云、特征、预测中心）
         combined_out = self.combine_classes(sampled_out, ['seg_points', 'seg_logits', 'seg_vote_preds', 'seg_feats', 'center_preds', 'batch_idx'])
-
+        #将合并后的采样结果转换为适合检测头处理的特征（如体素特征）
         extract_output = self.extract_feat(combined_out, dict_to_sample, gt_bboxes_3d=gt_bboxes_3d, multiscale_features=seg_out_dict['decoder_features'])
-
+        # 提取虚拟体素特征、坐标和中心（检测头的输入）
         voxel_feats = extract_output['virtual_feats']
         voxel_coors = extract_output['virtual_coors']
         voxel_xyz = extract_output['virtual_centers']
-
+         # 检测头接收体素特征，输出预测结果
         outs = self.bbox_head(voxel_feats)
-
+        # 准备损失计算的输入：预测结果、体素坐标、批次索引、真值、元数据
         loss_inputs = (outs['cls_logits'], outs['reg_preds']) + (voxel_xyz, voxel_coors[:, 0]) + (gt_bboxes_3d, gt_labels_3d, img_metas)
+        # 计算检测损失（分类损失、回归损失等），支持IoU预测和辅助质心
         det_loss = self.bbox_head.loss(
             *loss_inputs, iou_logits=outs.get('iou_logits', None), gt_bboxes_ignore=gt_bboxes_ignore, aux_xyz=extract_output['virtual_centroid'])
-
+        # 获取预测边界框及相关特征（用于后续精细处理或可视化）
         bbox_list = self.bbox_head.get_bboxes(
             outs['cls_logits'], outs['reg_preds'],
             voxel_xyz, voxel_feats, voxel_coors[:, 0], img_metas,
             rescale=False,
             iou_logits=outs.get('iou_logits', None))
+        # 提取预测中心、类别、特征和预测框参数
         query_xyz = [x[0].gravity_center for x in bbox_list]
         query_cat = [x[2] for x in bbox_list]
         query_feats = [x[3] for x in bbox_list]
@@ -514,9 +543,9 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
         if hasattr(self.bbox_head, 'print_info'):
             self.print_info.update(self.bbox_head.print_info)
-        losses.update(det_loss)
+        losses.update(det_loss)# 将检测损失合并到总损失中
         losses.update(self.print_info)
-
+        # 根据是否作为RPN（区域提议网络）返回不同格式的输出
         if self.as_rpn:
             output_dict = dict(
                 rpn_losses=losses,
@@ -549,7 +578,7 @@ class SingleStageFSDV2(SingleStage3DDetector):
         out_dict = {}
         for name in data_dict:
             if name in name_list:
-                out_dict[name] = torch.cat(data_dict[name], 0)
+                out_dict[name] = torch.cat(data_dict[name], 0) # 将该字段下的所有类别数据按第0维拼接（合并为一个张量）
         return out_dict
 
     def pre_voxelize(self, data_dict):
@@ -664,39 +693,41 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
         if self.cfg.get('batched_group_sample', False):
             return self.batched_group_sample(dict_to_sample, offset)
-
+        # 根据训练/测试模式选择配置
         cfg = self.train_cfg if self.training else self.test_cfg
 
         seg_logits = dict_to_sample['seg_logits']
+        # 确保seg_logits未经过sigmoid激活（logits允许正负值）
         assert (seg_logits < 0).any() # make sure no sigmoid applied
 
         if seg_logits.size(1) == self.num_classes:
-            seg_scores = seg_logits.sigmoid()
+            seg_scores = seg_logits.sigmoid()# 对logits应用sigmoid得到[0,1]的分割分数
         else:
             raise NotImplementedError
-
+        # 调整偏移量形状：(N, 类别数, 3)，3对应x/y/z坐标
         offset = offset.reshape(-1, self.num_classes, 3)
-        seg_points = dict_to_sample['seg_points'][:, :3]
-        fg_mask_list = [] # fg_mask of each cls
-        center_preds_list = [] # fg_mask of each cls
+        seg_points = dict_to_sample['seg_points'][:, :3]# 提取点云的3D坐标（x/y/z）
+        fg_mask_list = []# 存储每个类别的前景掩码（标记哪些点是该类的前景）
+        center_preds_list = [] # 存储每个类别的预测中心（点坐标+偏移量）
 
-        batch_idx = dict_to_sample['batch_idx']
-        batch_size = batch_idx.max().item() + 1
-        for cls in range(self.num_classes):
-            cls_score_thr = cfg['score_thresh'][cls]
-
+        batch_idx = dict_to_sample['batch_idx'] # 每个点所属的样本索引（如batch中第0个、第1个样本）
+        batch_size = batch_idx.max().item() + 1 # 计算batch中的样本数量
+        for cls in range(self.num_classes):# 遍历每个类别
+            cls_score_thr = cfg['score_thresh'][cls] # 该类别的分数阈值（用于筛选前景点）
+            # 获取该类别的前景掩码：标记哪些点是该类的前景（可能结合分数、真实框等条件）
             fg_mask = self.get_fg_mask(seg_scores, seg_points, cls, batch_idx, gt_bboxes_3d, gt_labels_3d)
-
+            # 确保每个样本至少有一个前景点（若不足，则强制选中每个样本的第一个点）
             if len(torch.unique(batch_idx[fg_mask])) < batch_size:
+                # 获取每个样本的起始点位置（用于保底采样）
                 one_random_pos_per_sample = self.get_sample_beg_position(batch_idx, fg_mask)
-                fg_mask[one_random_pos_per_sample] = True # at least one point per sample
+                fg_mask[one_random_pos_per_sample] = True # # 强制设为前景
 
-            fg_mask_list.append(fg_mask)
-
-            this_offset = offset[fg_mask, cls, :]
-            this_points = seg_points[fg_mask, :]
-            this_centers = this_points + this_offset
-            center_preds_list.append(this_centers)
+            fg_mask_list.append(fg_mask)# 保存该类别的前景掩码
+            # 计算该类别的预测中心：前景点坐标 + 对应类别的偏移量
+            this_offset = offset[fg_mask, cls, :]# 提取前景点在该类别的偏移量
+            this_points = seg_points[fg_mask, :]# 提取前景点的坐标
+            this_centers = this_points + this_offset# 计算预测中心
+            center_preds_list.append(this_centers)# 保存该类别的预测中心
 
 
         output_dict = {}
@@ -704,11 +735,11 @@ class SingleStageFSDV2(SingleStage3DDetector):
             data = dict_to_sample[data_name]
             cls_data_list = []
             for fg_mask in fg_mask_list:
-                cls_data_list.append(data[fg_mask])
+                cls_data_list.append(data[fg_mask])# 按前景掩码提取每个类别的数据
 
-            output_dict[data_name] = cls_data_list
-        output_dict['fg_mask_list'] = fg_mask_list
-        output_dict['center_preds'] = center_preds_list
+            output_dict[data_name] = cls_data_list # 存储：{数据名: [类别0数据, 类别1数据, ...]}
+        output_dict['fg_mask_list'] = fg_mask_list# 保存所有类别的前景掩码
+        output_dict['center_preds'] = center_preds_list# 保存所有类别的预测中心
 
         return output_dict
 
@@ -720,45 +751,47 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
     def get_fg_mask(self, seg_scores, seg_points, cls_id, batch_inds, gt_bboxes_3d, gt_labels_3d):
         if self.training and self.train_cfg.get('disable_pretrain', False) and not self.runtime_info.get('enable_detection', False):
-            seg_scores = seg_scores[:, cls_id]
-            topks = self.train_cfg.get('disable_pretrain_topks', [100, 100, 100])
-            k = min(topks[cls_id], len(seg_scores))
-            top_inds = torch.topk(seg_scores, k)[1]
-            fg_mask = torch.zeros_like(seg_scores, dtype=torch.bool)
-            fg_mask[top_inds] = True
+            seg_scores = seg_scores[:, cls_id]# 提取当前类别的分割分数：(总点数,)
+            topks = self.train_cfg.get('disable_pretrain_topks', [100, 100, 100])# 每个类别的topk阈值
+            k = min(topks[cls_id], len(seg_scores))# 取当前类别对应的k值（不超过总点数）
+            top_inds = torch.topk(seg_scores, k)[1]# 取分数最高的k个点的索引
+            fg_mask = torch.zeros_like(seg_scores, dtype=torch.bool) # 初始化掩码（全False）
+            fg_mask[top_inds] = True # 标记topk个点为前景
         else:
-            seg_scores = seg_scores[:, cls_id]
-            cls_score_thr = self.cfg['score_thresh'][cls_id]
+            seg_scores = seg_scores[:, cls_id] # 提取当前类别的分割分数：(总点数,)
+            cls_score_thr = self.cfg['score_thresh'][cls_id]# 当前类别的分数阈值（如0.5）
             if self.training and self.runtime_info is not None:
-                buffer_thr = self.runtime_info.get('threshold_buffer', 0)
+                buffer_thr = self.runtime_info.get('threshold_buffer', 0)# 训练模式下可能有阈值缓冲（用于动态调整阈值）
             else:
-                buffer_thr = 0
-            fg_mask = seg_scores > cls_score_thr + buffer_thr
+                buffer_thr = 0# 测试模式下无缓冲
+            fg_mask = seg_scores > cls_score_thr + buffer_thr# 前景掩码：分数超过「阈值+缓冲」的点为前景
 
-        # add fg points
+        # 条件：训练模式 + 配置启用「添加真实前景点」（add_gt_fg_points） + 未停止添加
         cfg = self.train_cfg if self.training else self.test_cfg
 
         if cfg.get('add_gt_fg_points', False) and self.training:
             if self.runtime_info.get('stop_add_gt_fg_points', False):
                 return fg_mask
-            bsz = len(gt_bboxes_3d)
+            bsz = len(gt_bboxes_3d)# batch大小（样本数量）
+            # 断言：点数量、分数数量、批量索引数量一致
             assert len(seg_scores) == len(seg_points) == len(batch_inds)
+            # 将点云按样本分割（每个样本的点单独处理）
             point_list = self.split_by_batch(seg_points, batch_inds, bsz)
-            gt_fg_mask_list = []
+            gt_fg_mask_list = []# 存储每个样本的「真实前景点掩码」
 
             for i, points in enumerate(point_list):
-
-                gt_mask = gt_labels_3d[i] == cls_id
-                gts = gt_bboxes_3d[i][gt_mask]
-
+                # 找到当前样本中真实标签等于cls_id的边界框（筛选同类别的真实框）
+                gt_mask = gt_labels_3d[i] == cls_id# 真实标签是否为当前类别
+                gts = gt_bboxes_3d[i][gt_mask]# 筛选出的同类真实框
+                # 若该样本无同类真实框，或无点，则掩码全False
                 if not gt_mask.any() or len(points) == 0:
                     gt_fg_mask_list.append(gt_mask.new_zeros(len(points), dtype=torch.bool))
                     continue
-
+                # 判断点是否在真实框内：in_box返回> -1表示在框内（视为前景）
                 gt_fg_mask_list.append(gts.points_in_boxes(points) > -1)
-
+            # 将每个样本的真实前景掩码合并为整体掩码（与batch_inds对应）
             gt_fg_mask = self.combine_by_batch(gt_fg_mask_list, batch_inds, bsz)
-            fg_mask = fg_mask | gt_fg_mask
+            fg_mask = fg_mask | gt_fg_mask# 合并：原前景掩码 或 真实前景掩码（取并集，补充真实框内的点）
 
 
         return fg_mask
