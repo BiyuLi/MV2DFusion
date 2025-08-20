@@ -1,6 +1,7 @@
 data
 weights
 test
+.idea
 *.egg-info
 *.egg
 *__pycache__
