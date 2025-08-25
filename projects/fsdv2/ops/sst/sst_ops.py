@@ -95,7 +95,6 @@ def flat2window(feat, voxel_drop_lvl, flat2win_inds_dict, drop_info, padding=0):
         padding = torch.tensor(padding, dtype=dtype, device=device)
         feat_3d = torch.ones((num_windows * max_tokens, feat_dim), dtype=dtype, device=device) * padding
         # if this_inds.max() >= num_windows * max_tokens:
-        #     set_trace()
         feat_3d[this_inds] = feat_this_dl
         feat_3d = feat_3d.reshape((num_windows, max_tokens, feat_dim))
         feat_3d_dict[dl] = feat_3d

@@ -338,9 +338,9 @@ class MV2DFusionHead(AnchorFreeHead):
             self.memory_instance_inds = x.new_zeros(B, self.memory_len) - 1#存储实例索引（如目标 ID），初始化为-1（表示无实例）
         else:#场景不变时的内存更新
             self.memory_timestamp += data['timestamp'].unsqueeze(-1).unsqueeze(-1)
-            self.memory_egopose = data['ego_pose_inv'].unsqueeze(1) @ self.memory_egopose
+            self.memory_egopose = data['ego_pose_inv'].unsqueeze(1) @ self.memory_egopose # 历史位姿转到当前坐标下
             self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose_inv'],
-                                                                     reverse=False)
+                                                                     reverse=False) #根据自车运动更新目标的世界坐标
             self.memory_timestamp = memory_refresh(self.memory_timestamp[:, :self.memory_len], x)
             self.memory_reference_point = memory_refresh(self.memory_reference_point[:, :self.memory_len], x)
             self.memory_embedding = memory_refresh(self.memory_embedding[:, :self.memory_len], x)
@@ -354,8 +354,7 @@ class MV2DFusionHead(AnchorFreeHead):
         if self.num_propagated > 0:
             # 计算伪参考点[256,3]
             pseudo_reference_points = self.pseudo_reference_points.weight * (
-                        self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3]
-             # 填充参考点
+                        self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3] #真实坐标 = 归一化坐标 × (最大值 - 最小值) + 最小值
             self.memory_reference_point[:, :self.num_propagated] = \
                 self.memory_reference_point[:, :self.num_propagated] + (1 - x).view(B, 1, 1) * pseudo_reference_points
             # 填充ego姿态
@@ -602,6 +601,18 @@ class MV2DFusionHead(AnchorFreeHead):
                                       unexpected_keys, error_msgs)
 
     def gen_dynamic_query(self, static_query, dynamic_query, dynamic_query_feats=None):
+        '''
+        Inputs:
+        static_query, 静态查询，300个参考点(x,y,z)
+        dynamic_query, 动态查询，n个图像检测，每个有25个候选，4维(x, y, z, conf)其中conf为深度分布概率
+        dynamic_query_feats，动态查询特征，n个检测，256维度特征
+        Outputs:
+        query_ref, 每个目标的加权参考坐标，通过25个候选点按照深度分布概率加权平均，表示检测最有可能的位置坐标
+        query_coords, 每个动态查询的所有候选3D坐标，已经归一化到[0, 1]范围
+        query_probs, 每个动态查询对应的候选点的概率(分数)
+        query_feats, n个动态查询对应的图像特征
+        query_mask, 每个动态查询的掩码， 1表示该位置为有效动态查询；0表示该位置是填充的，避免处理无效数据
+        '''
         B = len(dynamic_query)
         zero = static_query.sum() * 0
         max_len = max(x.size(0) for x in dynamic_query)

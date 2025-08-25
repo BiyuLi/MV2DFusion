@@ -287,10 +287,10 @@ class MV2DFusion(MVXTwoStageDetector):
                     'lidar2img': data['lidar2img'][b][v],# 激光雷达到图像的转换矩阵（融合点云与图像时用）
                     'num_views': V,# 总视图数量（当前样本的视图数）
                     # for debug
-                    # 'img': ori_imgs[b, v],
-                    # 'img_norm_cfg': img_metas[b]['img_norm_cfg'],
-                    # 'scene_token': img_metas[b]['scene_token'],
-                    # 'filename': img_metas[b]['filename'][v],
+                    'img': ori_imgs[b, v],
+                    'img_norm_cfg': img_metas[b]['img_norm_cfg'],
+                    'scene_token': img_metas[b]['scene_token'],
+                    'filename': img_metas[b]['filename'][v],
                 }
                 # 添加前一帧存在标志（可能用于时序模型）
                 img_meta['prev_exists'] = data['prev_exists'][b].clone()
@@ -402,8 +402,6 @@ class MV2DFusion(MVXTwoStageDetector):
                     losses[k] = v.nan_to_num()
         else:
             # 筛选有效样本的特征、图像和元数据，调用ROI Head计算损失
-            # import pdb
-            # pdb.set_trace()
             losses = self.img_roi_head.forward_train_w_feat(
                 [x[valid_inds] for x in feats], imgs[valid_inds], img_metas_valid, gt_bboxes_valid, gt_labels_valid, )
         return losses
@@ -632,8 +630,6 @@ class MV2DFusion(MVXTwoStageDetector):
                       centers2d=None,
                       **data):
         B, T, V, _, H, W = data['img'].shape
-        # import pdb
-        # pdb.set_trace()
         # 拆分历史帧（不计算主干网络梯度）和近期帧（计算主干网络梯度）
         prev_img = data['img'][:, :-self.num_frame_backbone_grads]# 历史帧：取前(T - K)帧
         rec_img = data['img'][:, -self.num_frame_backbone_grads:]# 近期帧：取最后K帧（需计算梯度）
@@ -681,10 +677,17 @@ class MV2DFusion(MVXTwoStageDetector):
             self.test_clip_id += 1
 
         imgs_det, feats_det, img_metas_det, imgs_shape = self.prepare_detection_data(img_metas, **data)
+        # feats_det: feats_det[level] = [n_cam, feat_c, lvl_h, lvl_w]
         B, V = imgs_shape[:2]
 
         # image query generation
         dets2d, dets = self.forward_roi_head(imgs_det, feats_det, img_metas_det)
+        # dets: dets[cam_idx] = [n_dets, 6]  6: [x1, x2, y1, y2, score, cls]
+        
+        # debug: vis roi detections
+        if False:
+            from tools.debug_tools.visualize import vis_dets_2d
+            vis_dets_2d(img_metas_det, dets, 0.4, "./vis_det2d")
         if self.use_2d_proposal:
             dets = data['proposals']
 
@@ -692,16 +695,16 @@ class MV2DFusion(MVXTwoStageDetector):
             proposal = torch.tensor([[0, 50, 50, 100, 0, 1]], dtype=dets[0].dtype,
                                     device=dets[0].device)
             dets = [proposal] + dets[1:]
-        rois = bbox2roi(dets)
+        rois = bbox2roi(dets)  #rois: [img_idx, x1, y1, x2, y2]
 
-        roi_feats = self.extract_roi_feats(feats_det, rois, **data)
+        roi_feats = self.extract_roi_feats(feats_det, rois, **data) # roi_feats: [n_rois, 256, 7, 7]
         n_rois_per_view = [len(p) for p in dets]
         n_rois_per_batch = [sum(n_rois_per_view[i * V: (i + 1) * V]) for i in range(B)]
         dyn_query, dyn_feats = self.img_query_generator(roi_feats, dets, img_metas_det,
                                                     n_rois_per_view=n_rois_per_view,
                                                     n_rois_per_batch=n_rois_per_batch,
                                                     data=dict())
-
+        #dyn_query[batch]:(n_rois, n_depth_bins, 4) -> (x, y, z, depth_prob), 表示预计的在某个深度bin目标的x,y,z lidar坐标及在这个深度的置信度 
         # lidar query generation
         out_dict = self.pts_backbone.simple_test(data['pts_feats'], img_metas)
         pts_feat, pts_pos, pts_query_feat, pts_query_center = self.pts_query_generator(

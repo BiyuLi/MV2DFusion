@@ -16,7 +16,6 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
 
 from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataset
-
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
 from mmdet.datasets import replace_ImageToTensor
@@ -24,7 +23,6 @@ import time
 import os.path as osp
 from pathlib import Path
 import sys
-
 CUR_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(CUR_DIR))
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader

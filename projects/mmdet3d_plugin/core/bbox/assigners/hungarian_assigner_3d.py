@@ -119,7 +119,6 @@ class HungarianAssigner3D(BaseAssigner):
             print(f"level {self.layer_indicator}: q_matched->{stats['num_q_matched']/total:.2f}, prop_matched->{stats['num_prop_matched']/total:.2f}")
 
             self.layer_indicator += 1
-            # import ipdb; ipdb.set_trace()
 
         # 4. assign backgrounds and foregrounds
         # assign all indices to backgrounds first

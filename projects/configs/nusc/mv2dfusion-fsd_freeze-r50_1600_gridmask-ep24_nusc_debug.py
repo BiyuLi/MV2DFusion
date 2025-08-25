@@ -41,7 +41,7 @@ tasks = [
 ]
 
 # training hyperparameter
-num_gpus = 8  # GPU数量
+num_gpus = 1  # GPU数量
 batch_size = 1  # 每个GPU的批量大小
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)  # 每个epoch的迭代次数
 num_epochs = 24  # 总训练epoch数
@@ -499,7 +499,7 @@ input_modality = dict(
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 ida_aug_conf = {
-    "resize_lim": (0.94, 1.25),
+    "resize_lim": (1.0, 1.0),
     "final_dim": (640, 1600),
     "bot_pct_lim": (0.0, 0.0),
     "rot_lim": (0.0, 0.0),

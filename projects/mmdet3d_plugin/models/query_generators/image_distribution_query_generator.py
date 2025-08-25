@@ -31,11 +31,11 @@ class ImageDistributionQueryGenerator(ImageSinglePointQueryGenerator):
                  ):
         super(ImageDistributionQueryGenerator, self).__init__(**kwargs)
         self.prob_bin = prob_bin
-        center = np.array(self.roi_feat_size)
+        center = np.array(self.roi_feat_size) #TODO 改成np.array(self.roi_feat_size)/2 更好，但实际没有用x,y方向的采样
         x_bins = np.linspace(center[0] + x_range[0], center[0] + x_range[1], prob_bin)
         y_bins = np.linspace(center[1] + y_range[0], center[1] + y_range[1], prob_bin)
         d_bins = np.linspace(depth_range[0], depth_range[1], prob_bin)
-        xyd_bins = torch.tensor(np.stack([x_bins, y_bins, d_bins], axis=-1), dtype=torch.float)
+        xyd_bins = torch.tensor(np.stack([x_bins, y_bins, d_bins], axis=-1), dtype=torch.float) # 这里不是视锥，是x, y, depth的范围。x_bins,y_bins实际上没有任何作用
         self.register_buffer('xyd_bins', xyd_bins)
 
         self.gt_guided = gt_guided
@@ -63,12 +63,13 @@ class ImageDistributionQueryGenerator(ImageSinglePointQueryGenerator):
         extra_feats = dict(intrinsic=self.process_intrins_feat(intrinsics))#[N,16]
 
         qg_args = dict()
-        qg_args['rois'] = bbox2roi(proposal_list)#[N,5]
+        # TODO 这里qg_args['rois']重复计算了，上层调用中计算过rois
+        qg_args['rois'] = bbox2roi(proposal_list)  # (n_dets, 5) [img_idx, x1, y1, x2, y2]
         if self.training:
             qg_args['gt_bboxes'] = kwargs['data']['gt_bboxes']
             qg_args['gt_depths'] = kwargs['data']['depths']
 
-        roi_feat, return_feats = self.get_roi_feat(x, proposal_list, extra_feats)
+        roi_feat, return_feats = self.get_roi_feat(x, proposal_list, extra_feats) # (n_dets, 256)
         center_pred, return_feats = self.get_prediction(roi_feat, intrinsics, extrinsics, extra_feats, return_feats, n_rois_per_batch, qg_args)
 
         return center_pred, return_feats

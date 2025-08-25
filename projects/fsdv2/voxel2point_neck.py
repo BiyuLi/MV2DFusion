@@ -55,7 +55,6 @@ class Voxel2PointScatterNeck(nn.Module):
 
             if self.training and not self.normalize_local_xyz:
                 pass
-                # import ipdb; ipdb.set_trace()
                 # out_ids = (local_xyz.abs() >= voxel_size / 2 + 1e-3).any(-1).nonzero()[:, 0]
                 # assert (local_xyz.abs() < voxel_size / 2 + 0.1).all(), 'Holds in training. However, in test, this is not always True because of lack of point range clip'
             results = torch.cat([pts_feats, local_xyz], 1)

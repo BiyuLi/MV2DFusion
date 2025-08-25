@@ -489,8 +489,6 @@ class SingleStageFSDV2(SingleStage3DDetector):
                       runtime_info=None):
         if runtime_info is not None:
             self.runtime_info = runtime_info # stupid way to get arguements from children class
-        # import pdb
-        # pdb.set_trace()
         losses = {}
         # 过滤掉标签无效的真值框和标签（仅保留 l >= 0 的标注）
         gt_bboxes_3d = [b[l>=0] for b, l in zip(gt_bboxes_3d, gt_labels_3d)]

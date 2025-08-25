@@ -350,7 +350,7 @@ class ImageSinglePointQueryGenerator(BaseModule):
             x = x.flatten(1)
         for fc in fcs:
             x = self.relu(fc(x))
-        return x
+        return x  #当前全部branch都是直接输出x
 
     @force_fp32(apply_to=('center_pred', ))
     def center2lidar(self, center_pred, intrinsic, extrinsic):
