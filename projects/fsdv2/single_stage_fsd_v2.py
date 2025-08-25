@@ -169,48 +169,49 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
         else:
             raise NotImplementedError
-# 主要功能是融合原始点云特征与通过采样得到的 “虚拟点”（预测的目标中心）特征，
-# 经过体素化、编码和 backbone 处理后，提取用于后续检测任务的有效特征
+    # 主要功能是融合原始点云特征与通过采样得到的 “虚拟点”（预测的目标中心）特征，
+    # 经过体素化、编码和 backbone 处理后，提取用于后续检测任务的有效特征
     def extract_feat(self, sampled_dict, origin_dict, gt_bboxes_3d=None, multiscale_features=None):
         """Extract features from points."""
         if self.baseline_mode:
             return self.extract_feat_baseline(sampled_dict, origin_dict, gt_bboxes_3d, multiscale_features)
 
-        sampled_pts = sampled_dict['seg_points']# 采样点的坐标
-        sampled_centers = sampled_dict['center_preds']# 预测的目标中心（虚拟点）
-        sampled_logits = sampled_dict['seg_logits']# 采样点的分割logits
-        sampled_feats = sampled_dict['seg_feats']# 采样点的特征
-        sampled_batch_idx = sampled_dict['batch_idx']# 采样点所属的batch索引
+        sampled_pts = sampled_dict['seg_points']# 采样点的坐标[3000, 5]
+        sampled_centers = sampled_dict['center_preds']# 预测的目标中心（虚拟点）[3000, 3]
+        sampled_logits = sampled_dict['seg_logits']# 采样点的分割logits[3000, 11]
+        sampled_feats = sampled_dict['seg_feats']# 采样点的特征[3000, 131]
+        sampled_batch_idx = sampled_dict['batch_idx']# 采样点所属的batch索引[3000]
         device = sampled_pts.device
 
         # 裁剪预测中心到点云有效范围内（防止超出边界）
-        sampled_centers = self.clip_points(sampled_centers, self.point_cloud_range)
+        sampled_centers = self.clip_points(sampled_centers, self.point_cloud_range)#[3000, 3]
         # sampled_centers
         # 计算虚拟点与采样点的偏移量（归一化）
-        offset = (sampled_centers - sampled_pts[:, :3]) / 10 # hardcode a normalizer
+        offset = (sampled_centers - sampled_pts[:, :3]) / 10 # hardcode a normalizer[3000,3]
         # 拼接特征：采样点特征 + 偏移量 + 分割logits + 采样点的额外特征（如强度，第3列及以后）
-        proj_input = torch.cat([sampled_feats, offset, sampled_logits, sampled_pts[:, 3:]], 1)
-        vir_pts_feat = self.virtual_proj(proj_input)# 通过虚拟投影层（virtual_proj）生成虚拟点特征
+        proj_input = torch.cat([sampled_feats, offset, sampled_logits, sampled_pts[:, 3:]], 1)#[3000, 147]
+        vir_pts_feat = self.virtual_proj(proj_input)# 通过虚拟投影层（virtual_proj）生成虚拟点特征[3000, 64]
 
         if self.zero_virtual_feature:# 若启用，则将虚拟点特征置零（用于消融实验，验证虚拟点的作用）
             vir_pts_feat = vir_pts_feat * 0
         # 从原始字典中提取关键数据
-        ori_pts = origin_dict['seg_points']# 原始点坐标及特征
-        ori_batch_idx = origin_dict['batch_idx']# 原始点所属的batch索引
-        ori_pts_feat = origin_dict['seg_feats'] # 原始点特征
-        # 通过原始投影层（ori_proj）处理原始点特征（可能是维度调整或特征增强）
-        ori_pts_feat = self.ori_proj(ori_pts_feat)
+        ori_pts = origin_dict['seg_points']# 原始点坐标及特征[N, 5]
+        ori_batch_idx = origin_dict['batch_idx']# 原始点所属的batch索引[N]
+        ori_pts_feat = origin_dict['seg_feats'] # 原始点特征[N,131]
+        # 通过原始投影层（ori_proj）处理原始点特征（维度调整）
+        ori_pts_feat = self.ori_proj(ori_pts_feat)#[N,64]
         # 合并坐标：原始点的x/y/z + 虚拟点（预测中心）的x/y/z
-        cat_pts = torch.cat([ori_pts[:, :3], sampled_centers], 0)
+        cat_pts = torch.cat([ori_pts[:, :3], sampled_centers], 0)#[N+3000,3]
         # 合并特征：原始点特征 + 虚拟点特征
-        cat_feat = torch.cat([ori_pts_feat, vir_pts_feat], 0)
+        cat_feat = torch.cat([ori_pts_feat, vir_pts_feat], 0)#[N+3000,64]
         # 合并batch索引：原始点的batch索引 + 虚拟点的batch索引
-        cat_batch_idx = torch.cat([ori_batch_idx, sampled_batch_idx], 0)
+        cat_batch_idx = torch.cat([ori_batch_idx, sampled_batch_idx], 0)#[N+3000]
         # 对合并后的点进行体素化，得到每个点所属的体素坐标（coors）
-        coors = self.voxelize_with_batch_idx(cat_pts, cat_batch_idx)
+        coors = self.voxelize_with_batch_idx(cat_pts, cat_batch_idx)#[N+3000, 4]
         # 拼接坐标和特征，作为体素编码器的输入
-        voxel_encoder_input = torch.cat([cat_pts, cat_feat], 1)
+        voxel_encoder_input = torch.cat([cat_pts, cat_feat], 1)#[N+3000, 67]
         # 体素编码：将同一体素内的点特征聚合为体素特征
+        #voxel_feats[m,128] voxel_coors[m,4] 
         voxel_feats, voxel_coors, unq_inv = self.voxel_encoder(voxel_encoder_input, coors, return_inv=True)
         # 生成点类型指示符：0表示原始点，1表示虚拟点
         pts_indicators = torch.cat(
@@ -227,7 +228,8 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
         batch_size = voxel_coors[:, 0].max().item() + 1 # batch大小
         # 若提供多尺度特征，则进行融合（提升特征表达能力）
-        if multiscale_features is not None:
+        if batch_size is not None:
+            #[M,128] [M,4] 
             voxel_feats, voxel_coors, singlescale_mask = self.multiscale_fusion(multiscale_features, voxel_feats, voxel_coors)
 
         if self.only_virtual:# 若仅使用虚拟体素，则过滤掉不含虚拟点的体素
@@ -235,11 +237,12 @@ class SingleStageFSDV2(SingleStage3DDetector):
             voxel_feats = voxel_feats[virtual_mask]
             voxel_coors = voxel_coors[virtual_mask]
         # 通过backbone网络（如3D CNN）处理体素特征，得到高层特征
+         #[M,128] [M,4] 
         out_voxel_feats, out_coors, sparse_shape = self.backbone(voxel_feats, voxel_coors, batch_size)
-        # 若使用多尺度特征，根据掩码筛选最终特征
+        # 若使用多尺度特征，根据掩码筛选原始特征
         if multiscale_features is not None:
-            out_voxel_feats = out_voxel_feats[singlescale_mask]
-            out_coors = out_coors[singlescale_mask]
+            out_voxel_feats = out_voxel_feats[singlescale_mask]#[m, 128]
+            out_coors = out_coors[singlescale_mask]#[m, 4]
             voxel_coors = voxel_coors[singlescale_mask] # in fact, out_coors and voxel_coors are same # 确保坐标一致
 
         # get voxel center xyz# 体素大小和点云范围（预设参数）
@@ -259,9 +262,9 @@ class SingleStageFSDV2(SingleStage3DDetector):
             virtual_coors = out_coors
             virtual_centers = voxel_centers
         else:
-            virtual_voxel_feats = out_voxel_feats[virtual_mask]
-            virtual_coors = out_coors[virtual_mask]
-            virtual_centers = voxel_centers[virtual_mask]
+            virtual_voxel_feats = out_voxel_feats[virtual_mask]#[Vn,128]
+            virtual_coors = out_coors[virtual_mask]#[Vn,4]
+            virtual_centers = voxel_centers[virtual_mask]#[Vn,3]
         # 基础输出字典：包含虚拟体素特征及相关信息
         out_dict = dict(    
             virtual_feats=virtual_voxel_feats,
@@ -497,7 +500,7 @@ class SingleStageFSDV2(SingleStage3DDetector):
         # 调用分割器处理点云，传入点云、元数据、真值框和标签，as_subsegmentor=True表示作为子模块运行
         seg_out_dict = self.segmentor(points=points, img_metas=img_metas, gt_bboxes_3d=gt_bboxes_3d, gt_labels_3d=gt_labels_3d, as_subsegmentor=True)
         # 提取分割特征
-        seg_feats = seg_out_dict['seg_feats']
+        seg_feats = seg_out_dict['seg_feats']#[225173, 131]
         # 若配置了detach_segmentor，将分割特征detach（切断梯度回传）
         if self.train_cfg.get('detach_segmentor', False):
             seg_feats = seg_feats.detach()
@@ -505,23 +508,23 @@ class SingleStageFSDV2(SingleStage3DDetector):
         losses.update(seg_loss)# 将分割损失合并到总损失中
 
         dict_to_sample = dict(
-            seg_points=seg_out_dict['seg_points'],# 分割后的点云
-            seg_logits=seg_out_dict['seg_logits'].detach(),# 分割logits（detach避免梯度影响）
-            seg_vote_preds=seg_out_dict['seg_vote_preds'].detach(),# 投票预测（detach）
+            seg_points=seg_out_dict['seg_points'],# 分割后的点云 [225173, 5]
+            seg_logits=seg_out_dict['seg_logits'].detach(),# 分割logits（detach避免梯度影响）[225173, 11]
+            seg_vote_preds=seg_out_dict['seg_vote_preds'].detach(),# 投票预测（detach）[225173, 33]
             seg_feats=seg_feats,# 分割特征
             batch_idx=seg_out_dict['batch_idx'], # 点的批次索引
-            vote_offsets=seg_out_dict['offsets'].detach(),# 投票偏移（detach）
+            vote_offsets=seg_out_dict['offsets'].detach(),# 投票偏移（detach）[225173, 33]
         )
-        # 调用采样方法（sample/batched_group_sample等），按类别/组采样前景点
+        # 调用采样方法（sample/batched_group_sample等），按组采样前景点
         sampled_out = self.sample(dict_to_sample, dict_to_sample['vote_offsets'], gt_bboxes_3d, gt_labels_3d) # per cls list in sampled_out
-        # 合并不同类别/组的采样数据（如点云、特征、预测中心）
+        # 合并不同组的采样数据（如点云、特征、预测中心）
         combined_out = self.combine_classes(sampled_out, ['seg_points', 'seg_logits', 'seg_vote_preds', 'seg_feats', 'center_preds', 'batch_idx'])
         #将合并后的采样结果转换为适合检测头处理的特征（如体素特征）
         extract_output = self.extract_feat(combined_out, dict_to_sample, gt_bboxes_3d=gt_bboxes_3d, multiscale_features=seg_out_dict['decoder_features'])
         # 提取虚拟体素特征、坐标和中心（检测头的输入）
-        voxel_feats = extract_output['virtual_feats']
-        voxel_coors = extract_output['virtual_coors']
-        voxel_xyz = extract_output['virtual_centers']
+        voxel_feats = extract_output['virtual_feats']#[Vn,128]
+        voxel_coors = extract_output['virtual_coors']#[Vn,4]
+        voxel_xyz = extract_output['virtual_centers']#[Vn,3]
          # 检测头接收体素特征，输出预测结果
         outs = self.bbox_head(voxel_feats)
         # 准备损失计算的输入：预测结果、体素坐标、批次索引、真值、元数据
@@ -536,10 +539,10 @@ class SingleStageFSDV2(SingleStage3DDetector):
             rescale=False,
             iou_logits=outs.get('iou_logits', None))
         # 提取预测中心、类别、特征和预测框参数
-        query_xyz = [x[0].gravity_center for x in bbox_list]
-        query_cat = [x[2] for x in bbox_list]
-        query_feats = [x[3] for x in bbox_list]
-        query_pred = [torch.cat([x[0].tensor[:, 3:], x[1][:, None]], dim=1) for x in bbox_list]
+        query_xyz = [x[0].gravity_center for x in bbox_list]#[VN,3]
+        query_cat = [x[2] for x in bbox_list]#[VN]
+        query_feats = [x[3] for x in bbox_list]#[VN,128]
+        query_pred = [torch.cat([x[0].tensor[:, 3:], x[1][:, None]], dim=1) for x in bbox_list]#[VN,7]
 
         if hasattr(self.bbox_head, 'print_info'):
             self.print_info.update(self.bbox_head.print_info)
@@ -578,7 +581,7 @@ class SingleStageFSDV2(SingleStage3DDetector):
         out_dict = {}
         for name in data_dict:
             if name in name_list:
-                out_dict[name] = torch.cat(data_dict[name], 0) # 将该字段下的所有类别数据按第0维拼接（合并为一个张量）
+                out_dict[name] = torch.cat(data_dict[name], 0) # 将该字段下的所有组的数据按第0维拼接（合并为一个张量）
         return out_dict
 
     def pre_voxelize(self, data_dict):
@@ -751,7 +754,7 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
     def get_fg_mask(self, seg_scores, seg_points, cls_id, batch_inds, gt_bboxes_3d, gt_labels_3d):
         if self.training and self.train_cfg.get('disable_pretrain', False) and not self.runtime_info.get('enable_detection', False):
-            seg_scores = seg_scores[:, cls_id]# 提取当前类别的分割分数：(总点数,)
+            seg_scores = seg_scores[:, cls_id]# 提取当前组的分割分数：(总点数,)
             topks = self.train_cfg.get('disable_pretrain_topks', [100, 100, 100])# 每个类别的topk阈值
             k = min(topks[cls_id], len(seg_scores))# 取当前类别对应的k值（不超过总点数）
             top_inds = torch.topk(seg_scores, k)[1]# 取分数最高的k个点的索引
@@ -880,20 +883,21 @@ class SingleStageFSDV2(SingleStage3DDetector):
         return output_dict
 
     def batched_group_sample(self, dict_to_sample, offset):
-        batch_idx = dict_to_sample['batch_idx']
-        batch_size = batch_idx.max().item() + 1
-        # combine all classes as fg class.
+        batch_idx = dict_to_sample['batch_idx']# 获取每个点所属的样本索引（区分不同样本）
+        batch_size = batch_idx.max().item() + 1# 计算批量大小（样本数量）
+        # # 根据训练/测试状态获取对应的配置
         cfg = self.train_cfg if self.training else self.test_cfg
 
-        seg_logits = dict_to_sample['seg_logits']
-
+        seg_logits = dict_to_sample['seg_logits']# 获取分割任务的logits（未归一化的预测值）
+        # 断言：确保logits通道数 = 类别数 + 1（+1是背景类）
         assert seg_logits.size(1) == self.num_classes + 1 # we have background class
-        seg_scores = seg_logits.softmax(1)
-
-        offset = offset.reshape(-1, self.num_classes + 1, 3)
-        seg_points = dict_to_sample['seg_points'][:, :3]
-        fg_mask_list = [] # fg_mask of each cls
-        center_preds_list = [] # fg_mask of each cls
+        seg_scores = seg_logits.softmax(1)# 对logits做softmax，得到每个类别的概率分数
+        # 重塑偏移量：形状为 (点数量, 类别数+1, 3)，3对应x/y/z坐标偏移
+        offset = offset.reshape(-1, self.num_classes + 1, 3)#[225173, 11, 3]
+        seg_points = dict_to_sample['seg_points'][:, :3]# 获取点的坐标（取前3列，为x/y/z）
+        # 初始化：存储每组的前景掩码和预测中心
+        fg_mask_list = [] # 每个元素是一个布尔掩码，标记该组的前景点
+        center_preds_list = [] # 每个元素是该组前景点的预测中心坐标
 
 
         cls_score_thrs = cfg['score_thresh']
@@ -903,40 +907,41 @@ class SingleStageFSDV2(SingleStage3DDetector):
         num_groups = len(group_names)
         assert num_groups == len(cls_score_thrs)
         assert isinstance(cls_score_thrs, (list, tuple))
-        grouped_score = self.gather_group_by_names(seg_scores[:, :-1]) # without background score
-
+        # 按组聚合每个点云的概率分数（排除背景类，因为seg_scores[:, :-1]去掉了最后一列背景）
+        grouped_score = self.gather_group_by_names(seg_scores[:, :-1]) # without background score[225173, 6]
+        # 按组处理前景点
         for i in range(num_groups):
-
+            # 获取当前组的前景掩码：筛选出分数高于该组阈值的点
             fg_mask = self.get_fg_mask(grouped_score, None, i, None, None, None)
-
+            # 确保每个样本至少有一个前景点：如果某个样本没有前景点，随机选一个点补充
             if len(torch.unique(batch_idx[fg_mask])) < batch_size:
                 one_random_pos_per_sample = self.get_sample_beg_position(batch_idx, fg_mask)
                 fg_mask[one_random_pos_per_sample] = True # at least one point per sample
 
             fg_mask_list.append(fg_mask)
 
-            tmp_idx = []
+            tmp_idx = []# 获取当前组包含的类别在class_names中的索引
             for name in group_names[i]:
                 tmp_idx.append(class_names.index(name))
+            # 筛选当前组的偏移量（按前景掩码）
+            this_offset = offset[:, tmp_idx, :] # 取当前组类别的偏移量
+            this_offset = this_offset[fg_mask, ...]# 只保留前景点的偏移量[500,class_num,3]
+            this_logits = seg_logits[:, tmp_idx]# 取当前组类别的logits
+            this_logits = this_logits[fg_mask, :]# 只保留前景点的logits[500,class_num]
 
-            this_offset = offset[:, tmp_idx, :] 
-            this_offset = this_offset[fg_mask, ...]
-            this_logits = seg_logits[:, tmp_idx]
-            this_logits = this_logits[fg_mask, :]
-
-            offset_weight = self.get_offset_weight(this_logits)
+            offset_weight = self.get_offset_weight(this_logits)#计算偏移量的权重
             assert torch.isclose(offset_weight.sum(1), offset_weight.new_ones(len(offset_weight))).all()
-            this_offset = (this_offset * offset_weight[:, :, None]).sum(dim=1)
-            this_points = seg_points[fg_mask, :]
-            this_centers = this_points + offset_scale * this_offset
-            center_preds_list.append(this_centers)
+            this_offset = (this_offset * offset_weight[:, :, None]).sum(dim=1)# 加权求和得到最终偏移量（组内类别偏移的加权平均）[500,3]
+            this_points = seg_points[fg_mask, :]# 前景点的原始坐标[500,3]
+            this_centers = this_points + offset_scale * this_offset#计算预测中心：原始点坐标 + 缩放后的偏移量
+            center_preds_list.append(this_centers)# 保存当前组的预测中心
 
         output_dict = {}
-        for data_name in dict_to_sample:
+        for data_name in dict_to_sample:# 对输入数据中的每个字段，按组筛选并保存
             data = dict_to_sample[data_name]
             cls_data_list = []
             for fg_mask in fg_mask_list:
-                cls_data_list.append(data[fg_mask])
+                cls_data_list.append(data[fg_mask])# 用前景掩码筛选该组的数据
 
             output_dict[data_name] = cls_data_list
         output_dict['fg_mask_list'] = fg_mask_list
@@ -975,10 +980,14 @@ class SingleStageFSDV2(SingleStage3DDetector):
         score_per_group = []
         for g in groups:
             tmp_idx = []
+            # 1. 找到当前组内所有类别在class_names中的索引
             for name in g:
                 tmp_idx.append(class_names.index(name))
+            # 2. 提取当前组所有类别的分数，并在类别维度求和
+            # scores[:, tmp_idx]：取所有点在当前组类别上的分数（形状：[N, K]，N为点数量，K为组内类别数）
+            # .sum(1)：在第1维（类别维度）求和，得到每个点在当前组的总分数（形状：[N]）
             score_per_group.append(scores[:, tmp_idx].sum(1))
-
+        # 将每个组的分数堆叠成矩阵（形状：[N, M]，N为点数量，M为组数量）
         gathered_score = torch.stack(score_per_group, dim=1)
         return  gathered_score
 

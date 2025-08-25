@@ -174,7 +174,7 @@ class MV2DFusion(MVXTwoStageDetector):
         # 获取指定层级的特征（self.position_level=2，对应中间层特征）
         BN, C, H, W = img_feats[self.position_level].size()
         if self.training or training_mode:
-            # 训练模式：重塑为 [B, len_queue, N_cam, C, H, W]
+            # 训练模式：重塑为 [B, len_queue, N_cam, C, H, W][1, 1, 6, 256, 40, 100]
             img_feats_reshaped = img_feats[self.position_level].view(B, len_queue, int(BN / B / len_queue), C, H, W)
         else:
             # 推理模式：无需时序维度，重塑为 [B, N_cam, C, H, W]
@@ -271,7 +271,7 @@ class MV2DFusion(MVXTwoStageDetector):
         else:
             B, V, C, H, W = 1, *imgs.shape
         imgs = imgs.flatten(0, 1)
-        feats = [x.flatten(0, 1) for x in data['img_feats_for_det']]
+        feats = [x.flatten(0, 1) for x in data['img_feats_for_det']]#5个尺度的特征图
         img_metas_det = [dict() for _ in range(B * V)]
 
         for b in range(B):
@@ -338,7 +338,7 @@ class MV2DFusion(MVXTwoStageDetector):
             raise NotImplementedError
 
         tgt_cls = [x.lower() for x in tgt_cls] # 原始类别名称转为小写（避免大小写匹配问题）
-        fsd_cls = [x.lower() for x in fsd_cls]# FSD 类别名称转为小写
+        fsd_cls = [x.lower() for x in fsd_cls] # FSD 类别名称转为小写
         # 创建“原始类别 -> FSD 类别”的索引映射表
         to_fsd_cls_map = [fsd_cls.index(x) for x in tgt_cls]
         # 创建“FSD 类别 -> 原始类别”的索引映射表（用于反向转换）
@@ -368,13 +368,13 @@ class MV2DFusion(MVXTwoStageDetector):
     @auto_fp16(apply_to=('imgs', 'feats'))
     def forward_roi_head(self, imgs, feats, img_metas):
         dets2d = self.img_roi_head.simple_test_w_feat(feats, img_metas)
-        dets = self.process_2d_detections(dets2d, imgs.device)
+        dets = self.process_2d_detections(dets2d, imgs.device)#得到每个相机的所有检测结果
         return dets2d, dets
 
     @auto_fp16(apply_to=('imgs', 'feats'))
     def forward_roi_head_train(self, imgs, feats, img_metas, gt_bboxes, gt_labels):
         # TODO: check 2d annotation
-        gt_bboxes = sum(gt_bboxes, [])#统一不同批次 / 视图的标注格式，便于后续逐样本处理。
+        gt_bboxes = sum(gt_bboxes, [])#统一不同批次的标注格式，便于后续逐样本处理。
         gt_labels = sum(gt_labels, [])
         valid_inds = imgs.new_zeros(len(gt_bboxes), dtype=torch.bool)
         gt_bboxes_valid, gt_labels_valid, img_metas_valid = [], [], []
@@ -451,7 +451,7 @@ class MV2DFusion(MVXTwoStageDetector):
         if with_id:
             complement_gts = torch.cat([complement_gts, torch.zeros_like(complement_gts[..., :1]) - 1], dim=-1)
         return torch.cat([detections, complement_gts], dim=0)
-    #主要功能是将检测结果从 “按类别分组” 的格式转换为 “按目标实例” 的格式，并过滤掉过小的边界框，以便后续处理（如 3D 检测或跟踪）。
+    #主要功能是将检测结果将 “按类别拆分的检测框列表” 转换为 “包含类别 ID 的统一检测框张量”，并过滤掉过小的边界框，以便后续处理（如 3D 检测或跟踪）。
     def process_2d_detections(self, results, device):
         """
         :param results:
@@ -492,13 +492,13 @@ class MV2DFusion(MVXTwoStageDetector):
                           depths,
                           requires_grad=True,
                           return_losses=False,
-                          **data):
+                          **data):                                                                                                                                                                                                                                                                                                                                                                                                                     
         data['gt_bboxes'] = gt_bboxes
         data['gt_labels'] = gt_labels
         data['gt_bboxes_3d'] = gt_bboxes_3d
         data['gt_labels_3d'] = gt_labels_3d
         data['depths'] = depths
-
+        #[6, 3, 640, 1600]、多尺度特征图、每个batch中每个相机对应的元数据、原始图像尺寸
         imgs_det, feats_det, img_metas_det, imgs_shape = self.prepare_detection_data(img_metas, **data)
 
         B, V = imgs_shape[:2]
@@ -511,7 +511,7 @@ class MV2DFusion(MVXTwoStageDetector):
 
             self.eval()
             with torch.no_grad():
-                #生成 2D 检测结果dets（候选框）
+                #生成单批次下多相机的2D 检测结果dets(V,N,6) 6=X1,Y1,X2,Y2,socre,class_id
                 dets2d, dets = self.forward_roi_head(imgs_det, feats_det, img_metas_det)
                 #处理 2D 真实标注，得到dets_gt（用于补充检测结果）
                 dets_gt = self.process_2d_gt(sum(gt_bboxes, []), sum(gt_labels, []), imgs_det.device)
@@ -526,14 +526,15 @@ class MV2DFusion(MVXTwoStageDetector):
                     proposal = torch.tensor([[10, 20, 30, 40, 0, 1]], dtype=dets[0].dtype, device=dets[0].device)
                     dets = [proposal] + dets[1:]
                 #将边界框（dets）转换为 ROI（Region of Interest）格式，便于后续提取 ROI 特征。
-                rois = bbox2roi(dets)
+                rois = bbox2roi(dets)#[N,5]
             self.train()
-            #从图像特征（feats_det）中提取 ROI 区域的特征（roi_feats）
+            #从图像特征（feats_det）中提取 ROI 区域的特征（roi_feats）[93, 256, 7, 7]
             roi_feats = self.extract_roi_feats(feats_det, rois, **data)
-            #计算每个视角 / 每个样本的 ROI 数量（n_rois_per_view/n_rois_per_batch），用于特征分组
+            #计算每个相机的ROI 数量（n_rois_per_view/n_rois_per_batch），用于特征分组
             n_rois_per_view = [len(p) for p in dets]
             n_rois_per_batch = [sum(n_rois_per_view[i * V: (i + 1) * V]) for i in range(B)]
             #基于 ROI 特征生成动态查询（dyn_query）和辅助特征（dyn_feats），这些查询将用于后续与点云特征的融合
+            #dyn_query[N,50,4] 4=雷达坐标系下的位置＋深度概率。
             dyn_query, dyn_feats = self.img_query_generator(roi_feats, dets, img_metas_det,
                                                             n_rois_per_view=n_rois_per_view,
                                                             n_rois_per_batch=n_rois_per_batch,
@@ -549,7 +550,7 @@ class MV2DFusion(MVXTwoStageDetector):
                                                         n_rois_per_view=n_rois_per_view_gt,
                                                         n_rois_per_batch=n_rois_per_batch_gt,
                                                         data=data,)
-                n_rois_per_batch = n_rois_per_batch_gt
+                n_rois_per_batch = n_rois_per_batch_gt #93
 
             # lidar query generation
             # 转换3D标注为FSDet格式

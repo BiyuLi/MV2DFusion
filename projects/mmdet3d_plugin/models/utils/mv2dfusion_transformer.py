@@ -320,35 +320,39 @@ class MV2DFusionTransformerDecoder(BaseModule):
             self.post_norm = build_norm_layer(post_norm_cfg, self.embed_dims)[1]
         else:
             self.post_norm = None
-
+    #decoder
     def forward(self, query, *args, query_pos=None, reference_points=None, dyn_q_coords=None, dyn_q_probs=None,
                 dyn_q_mask=None, dyn_q_pos_branch=None, dyn_q_pos_with_prob_branch=None, dyn_q_prob_branch=None,
                 **kwargs):
         assert self.return_intermediate
-        dyn_q_logits = dyn_q_probs.log()
+        dyn_q_logits = dyn_q_probs.log()#[93,50]
 
         intermediate = []
         intermediate_reference_points = [reference_points]
-        intermediate_dyn_q_logits = []
-        for i, layer in enumerate(self.layers):
+        intermediate_dyn_q_logits = []# 存储动态查询对数概率的更新轨迹（用于分析或损失计算）
+        for i, layer in enumerate(self.layers):# 遍历每一层网络（如Transformer层）
             query = layer(query, *args, query_pos=query_pos, prev_ref_point=reference_points, **kwargs)
+            if(self.training==False and i==5):
+                pass
             if self.post_norm is not None:
-                interm_q = self.post_norm(query)
+                interm_q = self.post_norm(query)#层输出后做LayerNorm，稳定训练
             else:
                 interm_q = query
 
-            # get new dyn_q_probs
+            # get new dyn_q_probs   动态更新查询概率分布（dyn_q_probs）
+            # #通过当前层的概率分支，计算概率更新量（logits残差）
             dyn_q_logits_res = dyn_q_prob_branch[i](query.transpose(0, 1)[dyn_q_mask])
-            dyn_q_logits = dyn_q_logits + dyn_q_logits_res
-            dyn_q_probs = dyn_q_logits.softmax(-1)
+            dyn_q_logits = dyn_q_logits + dyn_q_logits_res# 累加更新对数概率（logits累加 = 概率乘法，避免数值下溢）
+            dyn_q_probs = dyn_q_logits.softmax(-1)# 将logits转回概率分布（softmax在候选坐标维度归一化，确保概率和为1）
 
-            # update reference_points
+            # update reference_points动态更新参考点（reference_points）
+            # #计算动态查询的加权坐标（概率加权平均）
             dyn_q_ref = (dyn_q_probs[:, None] @ dyn_q_coords)[:, 0]
-            new_reference_points = reference_points.clone()
-            new_reference_points[dyn_q_mask] = dyn_q_ref
-            reference_points = new_reference_points
+            new_reference_points = reference_points.clone()# 克隆确保不破坏原始值
+            new_reference_points[dyn_q_mask] = dyn_q_ref# 只更新需要动态调整的参考点
+            reference_points = new_reference_points  #更新参考点为新值，用于下一层计算
 
-            # update query_pos
+            # update query_pos 动态更新查询位置编码（query_pos）
             dyn_q_pos = dyn_q_pos_branch(dyn_q_coords.flatten(-2, -1))
             dyn_q_pos = dyn_q_pos_with_prob_branch(dyn_q_pos, dyn_q_probs)
             new_query_pos = query_pos.transpose(0, 1).clone()
@@ -382,7 +386,7 @@ class MV2DFusionTransformer(BaseModule):
             if hasattr(m, 'weight') and m.weight is not None and m.weight.dim() > 1:
                 xavier_init(m, distribution='uniform')
         self._is_init = True
-
+    # 入口
     def forward(self, tgt, query_pos, attn_masks,
                 feat_flatten_img, spatial_flatten_img, level_start_index_img, pc_range, img_metas, lidar2img,
                 feat_flatten_pts=None, pos_flatten_pts=None,
@@ -391,16 +395,16 @@ class MV2DFusionTransformer(BaseModule):
                 dyn_q_coords=None, dyn_q_probs=None, dyn_q_mask=None, dyn_q_pos_branch=None,
                 dyn_q_pos_with_prob_branch=None, dyn_q_prob_branch=None,
                 ):
-        query_pos = query_pos.transpose(0, 1).contiguous()
+        query_pos = query_pos.transpose(0, 1).contiguous()#[943, 1, 256]
 
         if tgt is None:
             tgt = torch.zeros_like(query_pos)
         else:
-            tgt = tgt.transpose(0, 1).contiguous()
+            tgt = tgt.transpose(0, 1).contiguous()#[943, 1, 256]
 
         if temp_memory is not None:
-            temp_memory = temp_memory.transpose(0, 1).contiguous()
-            temp_pos = temp_pos.transpose(0, 1).contiguous()
+            temp_memory = temp_memory.transpose(0, 1).contiguous()#历史特征[2816, 1, 256]
+            temp_pos = temp_pos.transpose(0, 1).contiguous()#历史位置编码[2816, 1, 256]
 
         assert cross_attn_masks is None
         attn_masks = [attn_masks, None]
@@ -506,30 +510,30 @@ class MixedCrossAttention(BaseModule):
         constant_init(self.weights_fc_img, val=0.0, bias=0.0)
         constant_init(self.weights_fc_pts, val=0.0, bias=0.0)
         xavier_init(self.output_proj_img, distribution="uniform", bias=0.0)
-
+    #crossAttension
     def forward(self, instance_feature, query_pos, reference_points, feat_flatten_img, spatial_flatten_img,
                 level_start_index_img, pc_range, lidar2img_mat, img_metas, feat_flatten_pts,
                 pos_flatten_pts, ):
 
         bs, num_anchor = reference_points.shape[:2]
-
+        # 将参考点从归一化坐标转换为实际3D空间坐标
         reference_points = reference_points * (pc_range[3:6] - pc_range[0:3]) + pc_range[0:3]
+        # 计算关键点（key_points）：在参考点基础上添加学习到的偏移量
         key_points = reference_points.unsqueeze(-2) + self.learnable_fc(instance_feature).reshape(bs, num_anchor, -1, 3)
-
-        # image cross-attention
-        weights_img = self._get_weights_img(instance_feature, query_pos, lidar2img_mat)
+        # image cross-attention   
+        weights_img = self._get_weights_img(instance_feature, query_pos, lidar2img_mat)#计算图像注意力权重（哪些图像区域与实例更相关）
         features_img = self.feature_sampling_img(feat_flatten_img, spatial_flatten_img, level_start_index_img,
                                                  key_points, weights_img, lidar2img_mat, img_metas)
-        output = self.output_proj_img(features_img)
-        output = self.drop(output) + instance_feature
+        output = self.output_proj_img(features_img)# 将采样的图像特征投影到与instance_feature匹配的维度
+        output = self.drop(output) + instance_feature # 残差连接（融合图像特征与原始实例特征）
 
         # point cloud cross-attention
-        weights_pts = self._get_weights_pts(instance_feature, query_pos)
+        weights_pts = self._get_weights_pts(instance_feature, query_pos)#计算点云注意力权重（哪些点云与实例更相关）
         key_points = (key_points[..., 0:2] - pc_range[0:2]) / (pc_range[3:5] - pc_range[0:2])   # [B, n_q, 13, 2]
         pts_q_pos = self.pts_q_embed(self.pos2posemb2d(key_points, num_pos_feats=16).flatten(-2, -1))
         pts_k_pos = self.pts_k_embed(self.pos2posemb2d(pos_flatten_pts / self.bev_norm, num_pos_feats=128))
         pts_q_pos = self.pts_q_prob(pts_q_pos, weights_pts.flatten(-2, -1))
-        output = self.attn(
+        output = self.attn(#点云交叉注意力计算
             output,
             key=feat_flatten_pts,
             value=feat_flatten_pts,
@@ -540,9 +544,9 @@ class MixedCrossAttention(BaseModule):
 
     def _get_weights_img(self, instance_feature, anchor_embed, lidar2img_mat, dyn_q_mask=None, dyn_feats=None):
         bs, num_anchor = instance_feature.shape[:2]
-        lidar2img = lidar2img_mat[..., :3, :].flatten(-2)
+        lidar2img = lidar2img_mat[..., :3, :].flatten(-2)# 提取投影矩阵的前3行（3x4，用于3D→2D投影），并展平为向量
         cam_embed = self.cam_embed(lidar2img)  # B, N, C
-        feat_pos_img = (instance_feature + anchor_embed).unsqueeze(2) + cam_embed.unsqueeze(1)
+        feat_pos_img = (instance_feature + anchor_embed).unsqueeze(2) + cam_embed.unsqueeze(1)## 融合实例特征、锚点嵌入和相机嵌入，得到带位置和相机信息的特征
         weights = self.weights_fc_img(feat_pos_img).reshape(bs, num_anchor, -1, self.num_groups).softmax(dim=-2)
         weights = weights.reshape(bs, num_anchor, self.num_cams, -1, self.num_groups).permute(0, 2, 1, 4,
                                                                                               3).contiguous()
@@ -564,16 +568,16 @@ class MixedCrossAttention(BaseModule):
         pts_extand = torch.cat([key_points, torch.ones_like(key_points[..., :1])], dim=-1)
         # points_2d: [B, V, n_q, num_pts, 3]
         points_2d = torch.matmul(lidar2img_mat[:, :, None, None], pts_extand[:, None, ..., None]).squeeze(-1)
-
+        # 除以深度分量w，得到像素坐标[x, y]（非齐次2D坐标）
         points_2d = points_2d[..., :2] / torch.clamp(points_2d[..., 2:3], min=1e-5)
-        points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]
+        points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]# 归一化到[0,1]范围（除以图像的填充后尺寸）
         points_2d[..., 1:2] = points_2d[..., 1:2] / img_metas[0]['pad_shape'][0][0]
-
+        # 展平批次和相机维度：[B, V, n_q, num_pts, 2] → [B×V, n_q, num_pts, 2]
         points_2d = points_2d.flatten(end_dim=1)  # [B * V, n_q, num_pts, 2]
-        points_2d = points_2d[:, :, None, None, :, :].repeat(1, 1, self.num_groups, self.num_levels, 1, 1)
-
+        points_2d = points_2d[:, :, None, None, :, :].repeat(1, 1, self.num_groups, self.num_levels, 1, 1)# 扩展维度以匹配分组（num_groups）和多尺度（num_levels），并重复维度
+        # 最终形状：[B×V, n_q, num_groups, num_levels, num_pts, 2]
         bn, num_value, _ = feat_flatten.size()
-        feat_flatten = feat_flatten.reshape(bn, num_value, self.num_groups, -1)
+        feat_flatten = feat_flatten.reshape(bn, num_value, self.num_groups, -1)#[6, 21250, 8, 32]
         # points_2d: [B * V, n_groups, n_levels, n_q, num_pts, 2]
         # weights: [B * V, n_q, n_groups, n_levels * n_pts]
         output = MultiScaleDeformableAttnFunction.apply(

@@ -327,16 +327,16 @@ class MV2DFusionHead(AnchorFreeHead):
     def pre_update_memory(self, data):
         x = data['prev_exists']
         B = x.size(0)
-        # refresh the memory when the scene changes
+        # refresh the memory when the scene changes场景变化时的内存初始化
         if self.memory_embedding is None or data['timestamp'].size(0) != self.memory_embedding.size(0):
             self.memory_embedding = x.new_zeros(B, self.memory_len, self.embed_dims)
             self.memory_reference_point = x.new_zeros(B, self.memory_len, 3)
             self.memory_timestamp = x.new_zeros(B, self.memory_len, 1)
             self.memory_egopose = x.new_zeros(B, self.memory_len, 4, 4)
             self.memory_velo = x.new_zeros(B, self.memory_len, 2)
-            self.memory_query_mask = x.new_zeros(B, self.memory_len, 1, dtype=torch.bool)
-            self.memory_instance_inds = x.new_zeros(B, self.memory_len) - 1
-        else:
+            self.memory_query_mask = x.new_zeros(B, self.memory_len, 1, dtype=torch.bool)#布尔掩码，指示内存中哪些位置有效
+            self.memory_instance_inds = x.new_zeros(B, self.memory_len) - 1#存储实例索引（如目标 ID），初始化为-1（表示无实例）
+        else:#场景不变时的内存更新
             self.memory_timestamp += data['timestamp'].unsqueeze(-1).unsqueeze(-1)
             self.memory_egopose = data['ego_pose_inv'].unsqueeze(1) @ self.memory_egopose
             self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose_inv'],
@@ -348,15 +348,20 @@ class MV2DFusionHead(AnchorFreeHead):
             self.memory_velo = memory_refresh(self.memory_velo[:, :self.memory_len], x)
             self.memory_query_mask = memory_refresh(self.memory_query_mask[:, :self.memory_len], x.bool())
             self.memory_instance_inds = memory_refresh(self.memory_instance_inds[:, :self.memory_len], x, value=-1)
-
+        
+        #这部分是为新序列的第一帧（无前序信息）填充初始 "伪参考点"，避免内存为空。
         # for the first frame, padding pseudo_reference_points (non-learnable)
         if self.num_propagated > 0:
+            # 计算伪参考点[256,3]
             pseudo_reference_points = self.pseudo_reference_points.weight * (
                         self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3]
+             # 填充参考点
             self.memory_reference_point[:, :self.num_propagated] = \
                 self.memory_reference_point[:, :self.num_propagated] + (1 - x).view(B, 1, 1) * pseudo_reference_points
+            # 填充ego姿态
             self.memory_egopose[:, :self.num_propagated] = self.memory_egopose[:, :self.num_propagated] + \
-                                                           (1 - x).view(B, 1, 1, 1) * torch.eye(4, device=x.device)
+                                                          (1 - x).view(B, 1, 1, 1) * torch.eye(4, device=x.device)
+            # 标记伪参考点为有效 
             self.memory_query_mask[:, :self.num_propagated] = \
                 self.memory_query_mask[:, :self.num_propagated] | (1 - x).view(B, 1, 1).bool()
 
@@ -441,24 +446,24 @@ class MV2DFusionHead(AnchorFreeHead):
 
     def temporal_alignment(self, query_pos, tgt, reference_points):
         B = query_pos.size(0)
-
+        # 对历史记忆的参考点进行归一化（映射到[0,1]范围）[1, 3072, 3]
         temp_reference_point = (self.memory_reference_point - self.pc_range[:3]) / (
                     self.pc_range[3:6] - self.pc_range[0:3])
-        temp_pos = self.query_embedding(pos2posemb3d(temp_reference_point))
-        temp_memory = self.memory_embedding
-        rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.size(1), 1, 1)
+        temp_pos = self.query_embedding(pos2posemb3d(temp_reference_point))# 为历史参考点生成3D位置编码，并通过嵌入层处理[1, 3072, 256]
+        temp_memory = self.memory_embedding# 历史记忆特征的嵌入[1, 3072, 256]
+        rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.size(1), 1, 1)# 初始化自我姿态矩阵（4x4变换矩阵，单位矩阵表示初始姿态）
 
         if self.with_ego_pos:
-            rec_ego_motion = torch.cat(
+            rec_ego_motion = torch.cat(# 构建当前帧的自我运动特征（包含位置和姿态变换）
                 [torch.zeros_like(reference_points[..., :3]), rec_ego_pose[..., :3, :].flatten(-2)], dim=-1)
-            rec_ego_motion = nerf_positional_encoding(rec_ego_motion)
-            tgt = self.ego_pose_memory(tgt, rec_ego_motion)
+            rec_ego_motion = nerf_positional_encoding(rec_ego_motion)# 对自我运动特征进行NERF风格的位置编码（增强高维表达）
+            tgt = self.ego_pose_memory(tgt, rec_ego_motion)# 用自我运动信息更新当前帧的目标特征和查询位置编码
             query_pos = self.ego_pose_pe(query_pos, rec_ego_motion)
-            memory_ego_motion = torch.cat(
+            memory_ego_motion = torch.cat(#[1,3072,15]# 构建历史记忆的自我运动特征（包含速度、时间戳、姿态）
                 [self.memory_velo, self.memory_timestamp, self.memory_egopose[..., :3, :].flatten(-2)], dim=-1).float()
-            memory_ego_motion = nerf_positional_encoding(memory_ego_motion)
-            temp_pos = self.ego_pose_pe(temp_pos, memory_ego_motion)
-            temp_memory = self.ego_pose_memory(temp_memory, memory_ego_motion)
+            memory_ego_motion = nerf_positional_encoding(memory_ego_motion)#[1, 3072, 180]
+            temp_pos = self.ego_pose_pe(temp_pos, memory_ego_motion)#[1, 3072, 256]# 用历史自我运动信息更新历史记忆的位置编码和特征
+            temp_memory = self.ego_pose_memory(temp_memory, memory_ego_motion)#[1, 3072, 256]
 
         query_pos += self.time_embedding(pos2posemb1d(torch.zeros_like(reference_points[..., :1])))
         temp_pos += self.time_embedding(pos2posemb1d(self.memory_timestamp).float())
@@ -484,17 +489,17 @@ class MV2DFusionHead(AnchorFreeHead):
             know_idx = known
             unmask_bbox = unmask_label = torch.cat(known)
             # gt_num
-            known_num = [t.size(0) for t in targets]
+            known_num = [t.size(0) for t in targets]#记录每个样本中目标的数量（如第 i 张图有 known_num[i] 个目标）
 
-            labels = torch.cat([t for t in labels])
-            boxes = torch.cat([t for t in targets])
+            labels = torch.cat([t for t in labels])# 所有样本的标签拼接成一维张量
+            boxes = torch.cat([t for t in targets])# 所有样本的边界框拼接成二维张量
             batch_idx = torch.cat([torch.full((t.size(0),), i) for i, t in enumerate(targets)])
 
-            known_indice = torch.nonzero(unmask_label + unmask_bbox)
+            known_indice = torch.nonzero(unmask_label + unmask_bbox) # 已知目标的索引
             known_indice = known_indice.view(-1)
             # add noise
             # groups = min(self.scalar, self.num_query // max(known_num))
-            known_indice = known_indice.repeat(self.scalar, 1).view(-1)
+            known_indice = known_indice.repeat(self.scalar, 1).view(-1)# 重复scalar次（生成多个副本）
             known_labels = labels.repeat(self.scalar, 1).view(-1).long().to(reference_points.device)
             known_bid = batch_idx.repeat(self.scalar, 1).view(-1)
             known_bboxs = boxes.repeat(self.scalar, 1).to(reference_points.device)
@@ -502,39 +507,39 @@ class MV2DFusionHead(AnchorFreeHead):
             known_bbox_scale = known_bboxs[:, 3:6].clone()
 
             if self.bbox_noise_scale > 0:
-                diff = known_bbox_scale / 2 + self.bbox_noise_trans
-                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-                known_bbox_center += torch.mul(rand_prob,
+                diff = known_bbox_scale / 2 + self.bbox_noise_trans# 计算噪声幅度（与目标尺寸相关，尺寸越大噪声可能越大）
+                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0# 生成[-1,1)的随机噪声
+                known_bbox_center += torch.mul(rand_prob,# 对中心坐标添加噪声
                                                diff) * self.bbox_noise_scale
                 known_bbox_center[..., 0:3] = (known_bbox_center[..., 0:3] - self.pc_range[0:3]) / (
-                            self.pc_range[3:6] - self.pc_range[0:3])
+                            self.pc_range[3:6] - self.pc_range[0:3])# 将中心坐标归一化到[0,1]范围（基于点云范围pc_range）
 
-                known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
+                known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)# 截断到有效范围
                 mask = torch.norm(rand_prob, 2, 1) > self.split
-                known_labels[mask] = self.num_classes
+                known_labels[mask] = self.num_classes# 对噪声过大的样本，将标签设为背景（num_classes表示背景类）
 
-            single_pad = int(max(known_num))
-            pad_size = int(single_pad * self.scalar)
-            padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
+            single_pad = int(max(known_num))# 单个样本的最大目标数（用于对齐长度）
+            pad_size = int(single_pad * self.scalar)# 总填充长度（副本数×单样本最大目标数）
+            padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)# 初始化填充用的零张量
             if reference_points.dim() == 2:
                 padded_reference_points = \
                     torch.cat([padding_bbox, reference_points], dim=0).unsqueeze(0).repeat(batch_size, 1, 1)
-            elif reference_points.dim() == 3:
+            elif reference_points.dim() == 3:# 根据reference_points的维度，拼接填充框和原始参考点
                 padded_reference_points = torch.cat([padding_bbox.unsqueeze(0).repeat(batch_size, 1, 1), reference_points], dim=1)
 
-            if len(known_num):
+            if len(known_num):# 生成每个目标在填充区域内的索引
                 map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
                 map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(self.scalar)]).long()
-            if len(known_bid):
+            if len(known_bid):# 将带噪声的目标中心坐标赋值到填充后的参考点中
                 padded_reference_points[(known_bid.long(), map_known_indice)] = known_bbox_center.to(
                     reference_points.device)
 
-            tgt_size = pad_size + self.num_query
-            attn_mask = torch.ones(tgt_size, tgt_size).to(reference_points.device) < 0
+            tgt_size = pad_size + self.num_query# 目标序列长度（填充长度+查询数）
+            attn_mask = torch.ones(tgt_size, tgt_size).to(reference_points.device) < 0# 初始化全False掩码（False表示可见）
             # match query cannot see the reconstruct
-            attn_mask[pad_size:, :pad_size] = True
+            attn_mask[pad_size:, :pad_size] = True# 规则1：原始查询（pad_size之后）不能看到填充的噪声目标（pad_size之前）
             # reconstruct cannot see each other
-            for i in range(self.scalar):
+            for i in range(self.scalar):# 规则2：不同噪声副本之间不可见（避免相互干扰）
                 if i == 0:
                     attn_mask[single_pad * i:single_pad * (i + 1), single_pad * (i + 1):pad_size] = True
                 if i == self.scalar - 1:
@@ -544,20 +549,20 @@ class MV2DFusionHead(AnchorFreeHead):
                     attn_mask[single_pad * i:single_pad * (i + 1), :single_pad * i] = True
 
             # update dn mask for temporal modeling
-            query_size = pad_size + self.num_query + self.num_propagated
-            tgt_size = pad_size + self.num_query + self.memory_len
+            query_size = pad_size + self.num_query + self.num_propagated# 扩展后的查询长度（含时间传播的特征）
+            tgt_size = pad_size + self.num_query + self.memory_len# 扩展后的目标长度（含历史记忆）
             temporal_attn_mask = torch.ones(query_size, tgt_size).to(reference_points.device) < 0
-            temporal_attn_mask[:attn_mask.size(0), :attn_mask.size(1)] = attn_mask
-            temporal_attn_mask[pad_size:, :pad_size] = True
+            temporal_attn_mask[:attn_mask.size(0), :attn_mask.size(1)] = attn_mask# 保留原有掩码
+            temporal_attn_mask[pad_size:, :pad_size] = True# 强化原始查询不看填充目标的规则
             attn_mask = temporal_attn_mask
 
             mask_dict = {
-                'known_indice': torch.as_tensor(known_indice).long(),
-                'batch_idx': torch.as_tensor(batch_idx).long(),
-                'map_known_indice': torch.as_tensor(map_known_indice).long(),
-                'known_lbs_bboxes': (known_labels, known_bboxs),
-                'know_idx': know_idx,
-                'pad_size': pad_size
+                'known_indice': torch.as_tensor(known_indice).long(), # 已知目标的索引
+                'batch_idx': torch.as_tensor(batch_idx).long(), # 批次索引
+                'map_known_indice': torch.as_tensor(map_known_indice).long(),# 填充后的索引映射
+                'known_lbs_bboxes': (known_labels, known_bboxs),# 带噪声的标签和边界框
+                'know_idx': know_idx,# 已知目标的标记
+                'pad_size': pad_size# 填充长度
             }
         else:
             if reference_points.dim() == 2:
@@ -601,19 +606,19 @@ class MV2DFusionHead(AnchorFreeHead):
         zero = static_query.sum() * 0
         max_len = max(x.size(0) for x in dynamic_query)
         max_len = max(max_len, 1)
-        query_coords = static_query.new_zeros((B, max_len, dynamic_query[0].size(1), 3))
-        query_probs = static_query.new_zeros((B, max_len, dynamic_query[0].size(1)))
-        query_ref = static_query.new_zeros((B, max_len, 3)) + zero + 0.5
-        query_mask = static_query.new_zeros((B, max_len), dtype=torch.bool)
-        query_feats = static_query.new_zeros((B, max_len, self.embed_dims))
+        query_coords = static_query.new_zeros((B, max_len, dynamic_query[0].size(1), 3))#[1, 93, 50, 3]
+        query_probs = static_query.new_zeros((B, max_len, dynamic_query[0].size(1)))#[1,93,50]
+        query_ref = static_query.new_zeros((B, max_len, 3)) + zero + 0.5#[1,93,3]
+        query_mask = static_query.new_zeros((B, max_len), dtype=torch.bool)#[1,93]
+        query_feats = static_query.new_zeros((B, max_len, self.embed_dims))#[1, 93, 256]
         self.num_query = max_len
 
         for b in range(B):
-            dyn_q = dynamic_query[b][..., :3].clone()
-            dyn_q[..., 0:3] = (dyn_q[..., 0:3] - self.pc_range[0:3]) / (
+            dyn_q = dynamic_query[b][..., :3].clone()# 提取当前样本的动态查询坐标（前3维）
+            dyn_q[..., 0:3] = (dyn_q[..., 0:3] - self.pc_range[0:3]) / (# 坐标归一化到[0,1]区间
                     self.pc_range[3:6] - self.pc_range[0:3])
-            dyn_q_prob = dynamic_query[b][..., 3]
-            ref_point = (dyn_q_prob[:, None] @ dyn_q)[:, 0]
+            dyn_q_prob = dynamic_query[b][..., 3] # 提取动态查询的概率（第4维）
+            ref_point = (dyn_q_prob[:, None] @ dyn_q)[:, 0] # 计算参考点（概率加权的坐标中心）
             query_coords[b, :dyn_q.size(0)] = dyn_q
             query_probs[b, :dyn_q.size(0)] = dyn_q_prob
             query_ref[b, :dyn_q.size(0)] = ref_point
@@ -633,27 +638,27 @@ class MV2DFusionHead(AnchorFreeHead):
     def forward(self, img_metas, dyn_query=None, dyn_feats=None,
                 pts_query_center=None, pts_query_feat=None, pts_feat=None, pts_pos=None, **data):
 
-        # zero init the memory bank
+        # zero init the memory bank# 初始化记忆库
         self.pre_update_memory(data)
 
         # process image feats
         intrinsics = data['intrinsics'] / 1e3
-        extrinsics = data['extrinsics'][..., :3, :]
-        mln_input = torch.cat([intrinsics[..., 0,0:1], intrinsics[..., 1,1:2], extrinsics.flatten(-2)], dim=-1)
-        mln_input = mln_input.flatten(0, 1).unsqueeze(1)
-        mlvl_feats = data['img_feats_for_det']
+        extrinsics = data['extrinsics'][..., :3, :]# 构建多层级网络（MLN）的输入：拼接内参的焦距和展平的外参
+        mln_input = torch.cat([intrinsics[..., 0,0:1], intrinsics[..., 1,1:2], extrinsics.flatten(-2)], dim=-1)#[[1, 6, 14]]
+        mln_input = mln_input.flatten(0, 1).unsqueeze(1)# 调整形状以匹配网络输入[6,1,14]
+        mlvl_feats = data['img_feats_for_det']# 处理多层级图像特征
         B, N, _, _, _ = mlvl_feats[0].shape
-        feat_flatten_img = []
-        spatial_flatten_img = []
-        for i in range(1, len(mlvl_feats)):
+        feat_flatten_img = []# 存储展平后的图像特征
+        spatial_flatten_img = []# 存储每层特征的空间尺寸 (H, W)
+        for i in range(1, len(mlvl_feats)):# 遍历多层级特征（从索引1开始
             B, N, C, H, W = mlvl_feats[i].shape
-            mlvl_feat = mlvl_feats[i].reshape(B * N, C, -1).transpose(1, 2)
-            mlvl_feat = self.spatial_alignment(mlvl_feat, mln_input)
-            feat_flatten_img.append(mlvl_feat.to(torch.float))
+            mlvl_feat = mlvl_feats[i].reshape(B * N, C, -1).transpose(1, 2) # 重塑特征：(B*N, C, H*W) → 转置为 (B*N, H*W, C)（序列形式）
+            mlvl_feat = self.spatial_alignment(mlvl_feat, mln_input)# 空间对齐：利用相机参数（mln_input）调整特征，适应不同相机视角
+            feat_flatten_img.append(mlvl_feat.to(torch.float)) # 收集特征
             spatial_flatten_img.append((H, W))
-        feat_flatten_img = torch.cat(feat_flatten_img, dim=1)
-        spatial_flatten_img = torch.as_tensor(spatial_flatten_img, dtype=torch.long, device=mlvl_feats[0].device)
-        try:
+        feat_flatten_img = torch.cat(feat_flatten_img, dim=1)# 拼接所有层级的图像特征（按序列维度拼接）
+        spatial_flatten_img = torch.as_tensor(spatial_flatten_img, dtype=torch.long, device=mlvl_feats[0].device)# 转换空间尺寸为张量，用于后续计算特征层级的起始索引
+        try:# 计算 H*W 的累积和，得到每层的起始位置（如第1层结束后，第2层从该位置开始）
             level_start_index_img = torch.cat((spatial_flatten_img.new_zeros((1, )), spatial_flatten_img.prod(1).cumsum(0)[:-1]))
         except RuntimeError:
             print("CUDA prod操作失败，回退到CPU计算")
@@ -664,58 +669,58 @@ class MV2DFusionHead(AnchorFreeHead):
             level_start_index_img = torch.cat(
                 (spatial_flatten_img.new_zeros((1,)), spatial_flatten_img_prod.cumsum(0)[:-1]))
 
-        # process point cloud feats
-        feat_flatten_pts = self.pts_embed(pts_feat)
-        pos_flatten_pts = pts_pos
+        # process point cloud feats# 点云特征嵌入：将点云特征（pts_feat）通过嵌入层映射到模型维度
+        feat_flatten_pts = self.pts_embed(pts_feat)#[B,N,256]
+        pos_flatten_pts = pts_pos#位置信息#[B,N,2]
 
-        # generate image query
+        # generate image query# 生成图像动态查询：基于参考点和动态特征生成查询的坐标、概率、特征等
         reference_points, query_coords, query_probs, query_feats, query_mask = \
             self.gen_dynamic_query(self.reference_points.weight, dyn_query, dyn_feats.get('query_feats', None))
 
-        # generate point cloud query
-        pts_ref = self.gen_pts_query(pts_query_center)
-        query_mask = torch.cat([torch.ones_like(pts_ref[..., 0]).bool(), query_mask], dim=1)
-        reference_points = torch.cat([pts_ref, reference_points], dim=1)
+        # 生成点云查询的参考点
+        pts_ref = self.gen_pts_query(pts_query_center)#归一化[B,104,3]
+        query_mask = torch.cat([torch.ones_like(pts_ref[..., 0]).bool(), query_mask], dim=1)# 合并点云和图像的查询掩码（标记有效查询）
+        reference_points = torch.cat([pts_ref, reference_points], dim=1)# 合并点云和图像的参考点（查询的初始空间位置）
+        # 区分图像查询和点云查询的数量
+        num_query_img = int(self.num_query - pts_ref.size(1))# 图像查询数量
+        num_query_pts = pts_ref.size(1)# 点云查询数量
 
-        num_query_img = int(self.num_query - pts_ref.size(1))
-        num_query_pts = pts_ref.size(1)
-
-        # denoise training
+        # denoise training# 去噪训练：为参考点添加噪声，并生成对应的掩码（用于训练时的噪声鲁棒性）
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(B, reference_points, img_metas)
-
-        # mask out padded query for attention
-        tgt_size = self.num_query + self.num_propagated
-        src_size = self.num_query + self.memory_len
+        
+        # mask out padded query for attention# 定义目标和源的查询尺寸（包含记忆库中的查询）
+        tgt_size = self.num_query + self.num_propagated # 目标查询尺寸（当前帧+传播的历史查询）
+        src_size = self.num_query + self.memory_len# 源查询尺寸（当前帧+记忆库查询）
         if attn_mask is None:
             attn_mask = torch.zeros((tgt_size, src_size), dtype=torch.bool, device=reference_points.device)
-        pad_size = attn_mask.size(0) - tgt_size
+        pad_size = attn_mask.size(0) - tgt_size #填充尺寸（用于对齐长度）
         if mask_dict is not None:
             assert pad_size == mask_dict['pad_size']
-        attn_mask = attn_mask.repeat(B, 1, 1)
-        tgt_query_mask = torch.cat([query_mask, self.memory_query_mask[:, :self.num_propagated, 0]], dim=1)
+        attn_mask = attn_mask.repeat(B, 1, 1)# 扩展掩码到批量维度，并重复以适应多头注意力
+        tgt_query_mask = torch.cat([query_mask, self.memory_query_mask[:, :self.num_propagated, 0]], dim=1)# 构建目标和源的查询掩码（结合当前查询和记忆库查询的有效性）
         src_query_mask = torch.cat([query_mask, self.memory_query_mask[:, :, 0]], dim=1)
-        attn_mask[:, :, pad_size:] = ~src_query_mask[:, None]
-        num_heads = self.transformer.decoder.layers[0].attentions[0].num_heads
+        attn_mask[:, :, pad_size:] = ~src_query_mask[:, None]# 标记无效的源查询（在注意力计算中忽略）
+        num_heads = self.transformer.decoder.layers[0].attentions[0].num_heads# 多头注意力：为每个头重复掩码
         attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)
 
-        # query content feature
-        tgt = self.dyn_q_embed.weight.repeat(B, num_query_img, 1)
-        pts_tgt = self.pts_q_embed.weight.repeat(B, num_query_pts, 1)
-        tgt = torch.cat([tgt.new_zeros((B, pad_size, self.embed_dims)), pts_tgt, tgt], dim=1)
-        pad_query_feats = query_feats.new_zeros([B, pad_size + self.num_query, self.embed_dims])
-        pts_query_feat = self.pts_query_embed(pts_query_feat)
-        pad_query_feats[:, pad_size:pad_size + num_query_pts] = pts_query_feat
+        # query content feature# 构建查询的内容特征（目标特征tgt）
+        tgt = self.dyn_q_embed.weight.repeat(B, num_query_img, 1)# 图像查询的嵌入
+        pts_tgt = self.pts_q_embed.weight.repeat(B, num_query_pts, 1) # 点云查询的嵌入
+        tgt = torch.cat([tgt.new_zeros((B, pad_size, self.embed_dims)), pts_tgt, tgt], dim=1)# 拼接填充、点云查询、图像查询的特征
+        pad_query_feats = query_feats.new_zeros([B, pad_size + self.num_query, self.embed_dims])# 处理查询的特征（结合动态查询特征）
+        pts_query_feat = self.pts_query_embed(pts_query_feat)# 点云查询特征嵌入
+        pad_query_feats[:, pad_size:pad_size + num_query_pts] = pts_query_feat# 填充点云和图像的查询特征
         pad_query_feats[:, pad_size + num_query_pts:pad_size + self.num_query] = query_feats
-        tgt = self.dyn_q_enc(tgt, pad_query_feats)
+        tgt = self.dyn_q_enc(tgt, pad_query_feats)# 编码查询特征（可能是一个线性层或小网络）
 
-        # query positional encoding
+        # query positional encoding# 生成查询的位置编码（基于参考点的3D位置）
         query_pos = self.query_embedding(pos2posemb3d(reference_points))
         tgt, query_pos, reference_points, temp_memory, temp_pos, rec_ego_pose = \
             self.temporal_alignment(query_pos, tgt, reference_points)
 
-        # encode position distribution for image query
-        query_pos_det = self.dyn_q_pos(query_coords.flatten(-2, -1))
-        query_pos_det = self.dyn_q_pos_with_prob(query_pos_det, query_probs)
+        # # 为图像查询的位置编码添加概率信息（动态调整位置分布）
+        query_pos_det = self.dyn_q_pos(query_coords.flatten(-2, -1))#[1, 93, 256]
+        query_pos_det = self.dyn_q_pos_with_prob(query_pos_det, query_probs)# 结合查询概率#[1, 93, 256]
         query_pos[:, pad_size + num_query_pts:pad_size + self.num_query] = query_pos_det
 
         dyn_q_mask = torch.zeros_like(tgt[..., 0]).bool()
@@ -725,7 +730,7 @@ class MV2DFusionHead(AnchorFreeHead):
         dyn_q_coords = query_coords[dyn_q_mask_img]
         dyn_q_probs = query_probs[dyn_q_mask_img]
 
-        # transformer decoder
+        # transformer decoder# Transformer解码器：融合图像特征、点云特征、记忆特征，更新查询
         outs_dec, reference_points, dyn_q_logits = self.transformer(
             tgt, query_pos, attn_mask,
             feat_flatten_img, spatial_flatten_img, level_start_index_img, self.pc_range, img_metas, data['lidar2img'],
@@ -736,62 +741,64 @@ class MV2DFusionHead(AnchorFreeHead):
             dyn_q_pos_with_prob_branch=self.dyn_q_pos_with_prob, dyn_q_prob_branch=self.dyn_q_prob_branch,
         )
 
-        # generate prediction
-        outs_dec = torch.nan_to_num(outs_dec)
-        outputs_classes = []
-        outputs_coords = []
+        # generate prediction将解码器输出转换为目标类别和边界框坐标：
+        outs_dec = torch.nan_to_num(outs_dec)# 处理可能的NaN值（确保数值稳定性）
+        outputs_classes = []# 存储各层的类别预测
+        outputs_coords = []# 存储各层的坐标预测
         for lvl in range(outs_dec.shape[0]):
-            reference = inverse_sigmoid(reference_points[lvl].clone())
-            assert reference.shape[-1] == 3
+            reference = inverse_sigmoid(reference_points[lvl].clone())# 参考点反归一化（sigmoid的逆操作）
+            assert reference.shape[-1] == 3 # 确保是3D坐标（x, y, z）
             outputs_class = self.cls_branches[lvl](outs_dec[lvl])
             tmp = self.reg_branches[lvl](outs_dec[lvl])
 
             tmp[..., 0:3] += reference[..., 0:3]
-            tmp[..., 0:3] = tmp[..., 0:3].sigmoid()
+            tmp[..., 0:3] = tmp[..., 0:3].sigmoid() # 坐标计算：参考点 + 回归偏移量，再通过sigmoid归一化
 
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
-
+        # 堆叠所有层的预测结果
         all_cls_scores = torch.stack(outputs_classes)
         all_bbox_preds = torch.stack(outputs_coords)
-        all_bbox_preds[..., 0:3] = (
+        all_bbox_preds[..., 0:3] = (# 将归一化的坐标反归一化到实际点云范围（pc_range：点云的x/y/z最小值和最大值）
                     all_bbox_preds[..., 0:3] * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3])
 
-        # mask out padded query for output
+        #过滤填充的无效查询（将分数设为极低值，坐标设为0）
         all_cls_scores[:, :, pad_size:][:, ~tgt_query_mask] = -40 + all_cls_scores[:, :, pad_size:][:, ~tgt_query_mask] * 0
         all_bbox_preds[:, :, pad_size:][:, ~tgt_query_mask] = 0 + all_bbox_preds[:, :, pad_size:][:, ~tgt_query_mask] * 0
 
-        # apply nms for post-processing
-        iou_thr = self.post_bev_nms_thr
-        score_thr = self.post_bev_nms_score
-        ops = self.post_bev_nms_ops
+        # # 应用BEV（鸟瞰图）上的NMS（非极大值抑制）去除重复框
+        iou_thr = self.post_bev_nms_thr# NMS的IOU阈值
+        score_thr = self.post_bev_nms_score# 分数阈值
+        ops = self.post_bev_nms_ops# NMS操作配置
         if len(ops) > 0:
-            bbox_output = denormalize_bbox(all_bbox_preds[-1, :, pad_size:], None)
-            bbox_bev = bbox_output[..., [0, 1, 3, 4, 6]]
+            bbox_output = denormalize_bbox(all_bbox_preds[-1, :, pad_size:], None)# 反归一化边界框
+            bbox_bev = bbox_output[..., [0, 1, 3, 4, 6]]# 提取BEV视角的边界框参数（x, y, 宽, 长, 角度）
+            # 计算类别分数的最大值（用于NMS筛选）
             score_bev = all_cls_scores[-1, :, pad_size:].sigmoid().max(-1).values.clone()
-            score_bev[~tgt_query_mask] = 0
+            score_bev[~tgt_query_mask] = 0# 无效查询的分数设为0
             nms_tgt_query_mask = torch.zeros_like(tgt_query_mask)
-            for i in range(B):
+            for i in range(B):# 遍历每个样本
                 if 0 in ops:
                     assert len(ops) == 1
-                    # 0. all -> all nms
+                   # 对所有预测框执行NMS
                     all_boxes = bbox_bev[i]
                     all_scores = score_bev[i]
+                     # 转换BEV框格式并执行NMS
                     keep = nms_bev(xywhr2xyxyr(all_boxes), all_scores, iou_thr, pre_max_size=None, post_max_size=None)
-                    nms_tgt_query_mask[i, :][keep] = 1
-                    nms_tgt_query_mask[i, :][all_scores == 0] = 0
-
+                    nms_tgt_query_mask[i, :][keep] = 1# 标记保留的框
+                    nms_tgt_query_mask[i, :][all_scores == 0] = 0# 过滤低分数
+            # 结合分数阈值进一步过滤
             nms_tgt_query_mask &= all_cls_scores[-1, :, pad_size:].sigmoid().max(-1).values > score_thr
             tgt_query_mask &= nms_tgt_query_mask
-
+            # 最终过滤：无效框的分数设为-40，坐标设为0
             all_cls_scores[:, :, pad_size:][:, ~tgt_query_mask] = -40
             all_bbox_preds[:, :, pad_size:][:, ~tgt_query_mask] = 0
 
-        # update the memory bank
+        # update the memory bank# 更新记忆库：将当前帧的预测结果存入记忆库，供后续帧使用
         self.post_update_memory(data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict,
                                 query_mask=tgt_query_mask, instance_inds=None, )
-
+        # 处理去噪训练的输出（分离已知目标和未知目标的预测）
         if mask_dict and mask_dict['pad_size'] > 0:
             output_known_class = all_cls_scores[:, :, :mask_dict['pad_size'], :]
             output_known_coord = all_bbox_preds[:, :, :mask_dict['pad_size'], :]
@@ -800,13 +807,13 @@ class MV2DFusionHead(AnchorFreeHead):
             mask_dict['output_known_lbs_bboxes'] = (output_known_class, output_known_coord)
         else:
             mask_dict = None
-
+        # 整理输出结果
         outs = {
-            'all_cls_scores': all_cls_scores,
-            'all_bbox_preds': all_bbox_preds,
-            'dyn_cls_scores': all_cls_scores,
-            'dyn_bbox_preds': all_bbox_preds,
-            'dn_mask_dict': mask_dict,
+            'all_cls_scores': all_cls_scores,# 所有层的类别分数
+            'all_bbox_preds': all_bbox_preds,# 所有层的边界框预测
+            'dyn_cls_scores': all_cls_scores,# 动态查询的类别分数（与all_cls_scores一致）
+            'dyn_bbox_preds': all_bbox_preds,# 动态查询的边界框预测
+            'dn_mask_dict': mask_dict,# 去噪训练的掩码信息
         }
         return outs
 

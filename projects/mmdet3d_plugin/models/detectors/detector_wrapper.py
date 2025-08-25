@@ -94,26 +94,28 @@ class TwoStageDetectorWrapper(TwoStageDetector):
                              gt_masks=None,
                              proposals=None,
                              **kwargs):
-        x = feat
+        x = feat#掩码后的特征，某些图像中可能没有真值直接被删掉了
 
-        losses = dict()
+        losses = dict()# 初始化空字典，用于存储所有计算出的损失
 
         # RPN forward and loss
-        if self.with_rpn:
+        if self.with_rpn:# 判断模型是否包含RPN组件
+            # 获取RPN生成候选框的配置（优先用训练配置，若无则用测试配置）
             proposal_cfg = self.train_cfg.get('rpn_proposal',
                                               self.test_cfg.rpn)
-            rpn_losses, proposal_list = self.rpn_head.forward_train(
-                x,
-                img_metas,
-                gt_bboxes,
-                gt_labels=None,
-                gt_bboxes_ignore=gt_bboxes_ignore,
-                proposal_cfg=proposal_cfg,
+            # 调用RPN头的训练前向方法，计算RPN损失并生成候选框
+            rpn_losses, proposal_list = self.rpn_head.forward_train(#proposal_list=list[2000,5],多尺度特征图
+                x,                              # 输入特征
+                img_metas,                      # 图像元信息
+                gt_bboxes,                      # 真实边界框（用于计算RPN损失）
+                gt_labels=None,                  # RPN不依赖类别标签（仅负责生成候选框，不分类）
+                gt_bboxes_ignore=gt_bboxes_ignore,  # 需要忽略的真实框
+                proposal_cfg=proposal_cfg,# 候选框生成配置
                 **kwargs)
             losses.update(rpn_losses)
         else:
             proposal_list = proposals
-
+        # 对 RPN 生成的候选框进行精细化处理
         roi_losses = self.roi_head.forward_train(x, img_metas, proposal_list,
                                                  gt_bboxes, gt_labels,
                                                  gt_bboxes_ignore, gt_masks,
