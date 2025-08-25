@@ -332,8 +332,6 @@ class MV2DFusionTransformerDecoder(BaseModule):
         intermediate_dyn_q_logits = []# 存储动态查询对数概率的更新轨迹（用于分析或损失计算）
         for i, layer in enumerate(self.layers):# 遍历每一层网络（如Transformer层）
             query = layer(query, *args, query_pos=query_pos, prev_ref_point=reference_points, **kwargs)
-            if(self.training==False and i==5):
-                pass
             if self.post_norm is not None:
                 interm_q = self.post_norm(query)#层输出后做LayerNorm，稳定训练
             else:

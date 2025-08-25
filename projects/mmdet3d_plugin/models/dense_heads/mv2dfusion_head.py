@@ -715,9 +715,9 @@ class MV2DFusionHead(AnchorFreeHead):
 
         # query positional encoding# 生成查询的位置编码（基于参考点的3D位置）
         query_pos = self.query_embedding(pos2posemb3d(reference_points))
+        #融合了历史特征
         tgt, query_pos, reference_points, temp_memory, temp_pos, rec_ego_pose = \
             self.temporal_alignment(query_pos, tgt, reference_points)
-
         # # 为图像查询的位置编码添加概率信息（动态调整位置分布）
         query_pos_det = self.dyn_q_pos(query_coords.flatten(-2, -1))#[1, 93, 256]
         query_pos_det = self.dyn_q_pos_with_prob(query_pos_det, query_probs)# 结合查询概率#[1, 93, 256]
