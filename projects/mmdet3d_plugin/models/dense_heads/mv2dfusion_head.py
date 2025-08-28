@@ -33,7 +33,7 @@ from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox, normalize_b
 from mmcv.ops.box_iou_rotated import box_iou_rotated
 from mmdet3d.core import nms_bev
 from mmdet3d.core.bbox.structures import xywhr2xyxyr
-
+import torch.nn.functional as F
 from mmdet.models.utils import NormedLinear
 from projects.mmdet3d_plugin.models.utils.positional_encoding import pos2posemb3d, pos2posemb1d, \
     nerf_positional_encoding
@@ -103,7 +103,7 @@ class MV2DFusionHead(AnchorFreeHead):
                  prob_bin=50,
                  # nms config
                  post_bev_nms_thr=0.2,
-                 post_bev_nms_score=0.0,
+                 post_bev_nms_score=0.4,
                  post_bev_nms_ops=[],
                  # init config
                  init_cfg=None,
@@ -749,7 +749,7 @@ class MV2DFusionHead(AnchorFreeHead):
             temp_memory=temp_memory, temp_pos=temp_pos,
             cross_attn_masks=None, reference_points=reference_points,
             dyn_q_coords=dyn_q_coords, dyn_q_probs=dyn_q_probs, dyn_q_mask=dyn_q_mask, dyn_q_pos_branch=self.dyn_q_pos,
-            dyn_q_pos_with_prob_branch=self.dyn_q_pos_with_prob, dyn_q_prob_branch=self.dyn_q_prob_branch,
+            dyn_q_pos_with_prob_branch=self.dyn_q_pos_with_prob, dyn_q_prob_branch=self.dyn_q_prob_branch
         )
 
         # generate prediction将解码器输出转换为目标类别和边界框坐标：
@@ -786,15 +786,15 @@ class MV2DFusionHead(AnchorFreeHead):
             bbox_output = denormalize_bbox(all_bbox_preds[-1, :, pad_size:], None)# 反归一化边界框
             bbox_bev = bbox_output[..., [0, 1, 3, 4, 6]]# 提取BEV视角的边界框参数（x, y, 宽, 长, 角度）
             # 计算类别分数的最大值（用于NMS筛选）
-            score_bev = all_cls_scores[-1, :, pad_size:].sigmoid().max(-1).values.clone()
-            score_bev[~tgt_query_mask] = 0# 无效查询的分数设为0
+            score_bev = all_cls_scores[-1, :, pad_size:].sigmoid().max(-1).values.clone()#[1, 754]
+            score_bev[~tgt_query_mask] = 0# 无效查询的分数设为0  [1, 754]
             nms_tgt_query_mask = torch.zeros_like(tgt_query_mask)
             for i in range(B):# 遍历每个样本
                 if 0 in ops:
                     assert len(ops) == 1
                    # 对所有预测框执行NMS
-                    all_boxes = bbox_bev[i]
-                    all_scores = score_bev[i]
+                    all_boxes = bbox_bev[i]#[754, 5]
+                    all_scores = score_bev[i]#[754]
                      # 转换BEV框格式并执行NMS
                     keep = nms_bev(xywhr2xyxyr(all_boxes), all_scores, iou_thr, pre_max_size=None, post_max_size=None)
                     nms_tgt_query_mask[i, :][keep] = 1# 标记保留的框
@@ -805,7 +805,125 @@ class MV2DFusionHead(AnchorFreeHead):
             # 最终过滤：无效框的分数设为-40，坐标设为0
             all_cls_scores[:, :, pad_size:][:, ~tgt_query_mask] = -40
             all_bbox_preds[:, :, pad_size:][:, ~tgt_query_mask] = 0
+        
+        if(self.training==False):
+            from scipy.optimize import linear_sum_assignment
+            # 取最后一层解码器输出: [num_query, D]
+            last_dec = outs_dec[-1][0, :self.num_query]   # [num_query, D]
+            device = last_dec.device
+            Q_total, D = last_dec.shape
+            points=reference_points[-1][0]
+            # QK 投影参数
+            attn_mod = self.transformer.decoder.layers[-1].attentions[0].attn
+            W = attn_mod.in_proj_weight.to(device)      # [3D, D]
+            b = attn_mod.in_proj_bias.to(device)        # [3D]
+            W_q, W_k = W[0:D, :], W[D:2*D, :]
+            b_q, b_k = b[0:D], b[D:2*D]
+            scale = torch.sqrt(torch.tensor(D, dtype=torch.float, device=device))
 
+            # --- Step1: 计算所有图像 query 的 K（不过滤） ---
+            # K_img_all = torch.matmul(last_dec[num_query_pts:], W_k.T) + b_k   # [N_img_all, D]
+            K_img_all=last_dec[num_query_pts:]
+            # K_img_all = F.normalize(K_img_all, dim=-1)
+
+            # --- Step2: 过滤有效 query，并计算 Q ---
+            valid_mask = tgt_query_mask[0, :self.num_query]       # [num_query]
+            feats = last_dec[valid_mask]                          # [N_valid, D]
+            idx_map = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)  # 有效 query 原始下标 [N_valid]
+
+            # Q_all = torch.matmul(feats, W_q.T) + b_q
+            Q_all=feats
+            # Q_all = F.normalize(Q_all, dim=-1)
+
+            # --- Step3: 区分雷达 / 图像 ---
+            lidar_mask = idx_map < num_query_pts
+            img_mask   = idx_map >= num_query_pts
+            lidar_idx  = idx_map[lidar_mask]   # 有效雷达 query 原始索引
+            img_idx    = idx_map[img_mask]     # 有效图像 query 原始索引
+
+            # --- 雷达 → 图像 (Q: 过滤后雷达, K: 全部图像) ---
+            alpha = 12.0  # 可调节超参数
+            center = torch.zeros(points.shape[-1], device=device)
+            lidar2img_dict = {}
+            lidar2img_dist_dict = {}
+            lidar2img_fusedscore = {}
+            if lidar_idx.numel() > 0:
+                Q_lidar = Q_all[lidar_mask]                       # [Nr, D]
+                attn_lidar2img = torch.matmul(Q_lidar, K_img_all.T)    # [Nr, N_img_all]
+                probs = F.softmax(attn_lidar2img, dim=-1)
+
+                k = 20 if K_img_all.shape[0] >= 20 else 1
+                lidar_topk_scores, lidar_topk_indices  = torch.topk(probs, k=k, dim=1)
+                # --- 构造 cost_matrix [Nr, N_img_all] ---
+                Nr = lidar_idx.shape[0]
+                Nimg = K_img_all.shape[0]
+                fused_matrix = torch.full((Nr, Nimg), -1e6, device=device)
+                for i, q_idx in enumerate(lidar_idx.tolist()):
+                    topk_img_global = lidar_topk_indices[i].tolist()  # 候选全局索引
+                    sim_scores = lidar_topk_scores[i]                 # 相似度得分 [k]
+                    
+                    lidar_point = points[q_idx]
+                    img_points = points[num_query_pts +torch.tensor(topk_img_global, device=device)]
+                    dists = torch.norm(lidar_point.unsqueeze(0) - img_points, dim=-1)  # [k]
+                    
+                    # === Step1: logit变换相似度 ===
+                    sim_scores_logit = torch.log(sim_scores / (1 - sim_scores + 1e-9))
+
+                    # === Step2: 距离归一化 ===
+                    dist_norm = (dists - dists.min()) / (dists.max() - dists.min() + 1e-9)
+                    dist_sim = 1 - dist_norm  
+
+                    # === Step3: 权重 ===
+                    r = torch.norm(lidar_point - center)
+                    w_sim = torch.exp(-alpha * r)
+                    w_dist = 1.0 - w_sim
+
+                    # === Step4: 融合 ===
+                    fused_scores = w_sim * sim_scores_logit + w_dist * dist_sim
+                    
+                    fused_matrix[i, torch.tensor(topk_img_global, device=device)] = fused_scores
+
+                # # --- 匈牙利算法求解最优匹配 ---
+                # row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
+                # --- KM 算法最大权匹配 ---
+                row_ind, col_ind =self.km_max_weight_match(fused_matrix.detach().cpu().numpy())
+
+                # --- 保存匹配结果 ---
+                # --- 保存匹配结果 ---
+                for r_i, c_j in zip(row_ind, col_ind):
+                    lidar_qidx = lidar_idx[r_i].item()
+                    img_qidx = c_j    # 转回全局索引
+                    lidar2img_dict[lidar_qidx] = [img_qidx]   # ✅ 必须用 list
+            else:
+                lidar_top2_scores, lidar_topk_indices = None, None
+
+            # --- 图像 → 图像 (Q: 过滤后图像, K: 全部图像，不含自身) ---
+            if img_idx.numel() > 0:
+                Q_img = Q_all[img_mask]               # [Ni_valid, D]
+                attn_img2img = torch.matmul(Q_img, K_img_all.T) / scale   # [Ni_valid, N_img_all]
+
+                # 去掉 Q 对应的自身 K
+                for i, q_idx in enumerate(img_idx):
+                    attn_img2img[i, q_idx - num_query_pts] = -float("inf")
+
+                probs = F.softmax(attn_img2img, dim=-1)
+
+                k = 2 if K_img_all.shape[0] >= 2 else 1
+                img_top2_scores, img_top2_indices = torch.topk(probs, k=k, dim=1)
+                
+            else:
+                img_top2_scores, img_top2_indices = None, None
+            
+            top2_indices_list = []
+            if lidar_topk_indices is not None:
+                top2_indices_list.append(lidar_topk_indices.flatten())
+            if img_top2_indices is not None:
+                top2_indices_list.append(img_top2_indices.flatten())
+            if len(top2_indices_list) > 0:
+                all_top2_img_indices = torch.cat(top2_indices_list)       # 拼接
+                all_top2_img_indices = torch.unique(all_top2_img_indices) # 去重
+            else:
+                all_top2_img_indices = torch.tensor([], device=device, dtype=torch.long)
         # update the memory bank# 更新记忆库：将当前帧的预测结果存入记忆库，供后续帧使用
         self.post_update_memory(data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict,
                                 query_mask=tgt_query_mask, instance_inds=None, )
@@ -825,8 +943,62 @@ class MV2DFusionHead(AnchorFreeHead):
             'dyn_cls_scores': all_cls_scores,# 动态查询的类别分数（与all_cls_scores一致）
             'dyn_bbox_preds': all_bbox_preds,# 动态查询的边界框预测
             'dn_mask_dict': mask_dict,# 去噪训练的掩码信息
+            'top2_img_indices': all_top2_img_indices, # 新增：去重后的 top2 图像 query 索引
+            'lidar2img_dict':lidar2img_dict,
+            'tgt_query_mask':tgt_query_mask[0][:num_query_pts],
         }
         return outs
+    import numpy as np
+
+    def km_max_weight_match(self,weight_matrix: np.ndarray):
+        """
+        Kuhn-Munkres (Hungarian) Algorithm for Maximum Weight Matching.
+        :param weight_matrix: [n, m] 权重矩阵 (lidar数 × image数)，值越大表示匹配越好
+        :return: row_ind, col_ind  (匹配结果)
+        """
+        n, m = weight_matrix.shape
+        assert n <= m, "必须保证 image query 数量 >= lidar query 数量"
+
+        u = np.max(weight_matrix, axis=1)  # 行顶标
+        v = np.zeros(m)                    # 列顶标
+        p = -np.ones(m, dtype=int)         # 记录列匹配的行
+        for i in range(n):
+            links = -np.ones(m, dtype=int)
+            mins = np.full(m, np.inf)
+            visited = np.zeros(m, dtype=bool)
+            marked_i = i
+            marked_j = -1
+            j = -1
+            while True:
+                j = -1
+                for j1 in range(m):
+                    if not visited[j1]:
+                        cur = u[marked_i] + v[j1] - weight_matrix[marked_i][j1]
+                        if cur < mins[j1]:
+                            mins[j1] = cur
+                            links[j1] = marked_j
+                        if j == -1 or mins[j1] < mins[j]:
+                            j = j1
+                delta = mins[j]
+                for j1 in range(m):
+                    if visited[j1]:
+                        u[p[j1]] += delta
+                        v[j1] -= delta
+                    else:
+                        mins[j1] -= delta
+                u[marked_i] += delta
+                visited[j] = True
+                marked_j = j
+                if p[j] == -1:
+                    break
+                marked_i = p[j]
+            while links[j] != -1:
+                p[j] = p[links[j]]
+                j = links[j]
+            p[j] = i
+        row_ind = np.array([p[j] for j in range(m) if p[j] != -1])
+        col_ind = np.array([j for j in range(m) if p[j] != -1])
+        return row_ind, col_ind
 
     def prepare_for_loss(self, mask_dict):
         """
