@@ -24,12 +24,6 @@ from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.models.builder import build_query_generator
 
-import os
-import cv2
-import numpy as np
-from nuscenes.utils.data_classes import Box
-from pyquaternion import Quaternion
-from tools.debug_tools.visualize import vis_dets_2d
 def bbox3d2result(bboxes, scores, labels, obj_idxes=None, track_scores=None, attrs=None):
     result_dict = dict(
         boxes_3d=bboxes.to('cpu'),
@@ -667,106 +661,6 @@ class MV2DFusion(MVXTwoStageDetector):
                                             gt_labels, img_metas, centers2d, depths, gt_bboxes_ignore, **data)
 
         return losses
-    def map_global_img_indices(self, global_indices, dets):
-        """
-        把 flatten 之后的全局索引映射到 (cam_id, local_idx)
-        Args:
-            global_indices: List[int] 或 Tensor，flatten 后的一维索引
-            dets: List[Tensor]，长度=相机数，每个 shape=(Ni,6)
-        Returns:
-            List[Tuple[int, int]]，其中 int 是 (cam_id, local_idx)
-        """
-        mapping = []
-        start = 0
-        for cam_id, cam_dets in enumerate(dets):
-            num = len(cam_dets)
-            end = start + num
-            for gidx in global_indices:
-                if start <= gidx < end:
-                    local_idx = gidx - start
-                    mapping.append((cam_id, local_idx))
-            start = end
-        return mapping
-    def vis_bev_segmentation_style(self,
-                               voxel_xyz,
-                               query_pred,
-                               query_cat,
-                               bboxes,
-                               scores,
-                               labels,
-                               highlight_idx=None,
-                               mask=None,
-                               bev_range=[-50, 50, -50, 50],
-                               out_size=(512, 512)):
-        """
-        可视化 BEV 分割和 query 高亮（高亮目标为红色）
-        
-        Args:
-            voxel_xyz: [N_voxels, 3] 点云中心
-            query_pred: [N_queries, 3] query 位置
-            query_cat: [N_queries] 类别
-            bboxes, scores, labels: 最终3D检测结果
-            highlight_idx: 需要高亮的 query idx
-            mask: [N_queries] 布尔数组，False 的 query 不绘制
-            bev_range: [x_min, x_max, y_min, y_max]
-            out_size: 输出图像大小
-        Returns:
-            bev_img: [H, W, 3] 可视化 BEV 图
-        """
-        import numpy as np
-        import cv2
-        import matplotlib.cm as cm
-
-        H, W = out_size
-        bev_img = np.zeros((H, W, 3), dtype=np.uint8)
-
-        # 确保 tensor 在 CPU 并转换为 numpy
-        voxel_xyz = voxel_xyz.detach().cpu().numpy()
-        query_pred = query_pred[0].detach().cpu().numpy()
-        query_cat = query_cat[0].detach().cpu().numpy()
-        if mask is not None:
-            mask = mask.detach().cpu().numpy()
-
-        x_min, x_max, y_min, y_max = bev_range
-
-        # 映射点云到 BEV 灰色背景
-        xs = ((voxel_xyz[:, 0] - x_min) / (x_max - x_min) * W).astype(np.int32)
-        ys = ((y_max - voxel_xyz[:, 1]) / (y_max - y_min) * H).astype(np.int32)
-        xs = np.clip(xs, 0, W - 1)
-        ys = np.clip(ys, 0, H - 1)
-        bev_img[ys, xs, :] = 200  # 灰色点云背景
-
-        # 设置类别 colormap
-        cmap = cm.get_cmap('tab20', np.max(query_cat) + 1)
-
-        # 绘制每个 query
-        for i, (x, y, _) in enumerate(query_pred):
-            if mask is not None and not mask[i]:
-                continue  # 被 mask 掉的 query 不绘制
-            cx = int((x - x_min) / (x_max - x_min) * W)
-            cy = int((y_max - y) / (y_max - y_min) * H)
-            color = (np.array(cmap(query_cat[i])[:3]) * 255).astype(np.uint8)
-            if highlight_idx is not None and i == highlight_idx:
-                # 高亮 query: 红色填充 + 白色边框
-                cv2.circle(bev_img, (cx, cy), 10, (0, 0, 255), -1)
-                cv2.circle(bev_img, (cx, cy), 12, (255, 255, 255), 2)
-            else:
-                # 普通 query
-                cv2.circle(bev_img, (cx, cy), 4, color.tolist(), -1)
-
-        # 绘制 3D 检测框
-        for bbox, score, label in zip(bboxes, scores, labels):
-            x, y, z = bbox[:3]
-            cx = int((x - x_min) / (x_max - x_min) * W)
-            cy = int((y_max - y) / (y_max - y_min) * H)
-            if highlight_idx is not None:
-                # 高亮框用红色
-                cv2.rectangle(bev_img, (cx - 5, cy - 5), (cx + 5, cy + 5), (0, 0, 255), 2)
-            else:
-                cv2.rectangle(bev_img, (cx - 3, cy - 3), (cx + 3, cy + 3), (0, 128, 255), 1)
-
-        return bev_img
-
 
     def simple_test_pts(self, img_metas, **data):
         """Test function of point cloud branch."""
@@ -790,8 +684,8 @@ class MV2DFusion(MVXTwoStageDetector):
         dets2d, dets = self.forward_roi_head(imgs_det, feats_det, img_metas_det)
         # dets: dets[cam_idx] = [n_dets, 6]  6: [x1, x2, y1, y2, score, cls]
         
+        if False:
         # debug: vis roi detections
-        if True:
             from tools.debug_tools.visualize import vis_dets_2d
             vis_dets_2d(img_metas_det, dets, 0.5, "./vis_det2d_0.5")
         if self.use_2d_proposal:
@@ -820,132 +714,25 @@ class MV2DFusion(MVXTwoStageDetector):
         outs = self.fusion_bbox_head(img_metas, dyn_query=dyn_query, dyn_feats=dyn_feats,
                                   pts_query_center=pts_query_center, pts_query_feat=pts_query_feat, pts_feat=pts_feat,
                                   pts_pos=pts_pos, pts_shape=None, **data)
-
-        lidar2img_dict = outs['lidar2img_dict']   # {lidar_idx: [img_query_indices]}
-        bevmask=outs['tgt_query_mask']
-        save_dir = "./vis_lidar_img_pairs_filter_ronhe_assignment"
-       
-        
-        # 先获取 3D 检测结果
         bbox_list = self.fusion_bbox_head.get_bboxes(outs, img_metas)
-        bboxes, scores, labels = bbox_list[0]  # batch=0
-        from tools.debug_tools.visualize import vis_dets_2d, vis_bev
-        import os
-        import numpy as np
-        import cv2
-        import matplotlib.pyplot as plt
-        import matplotlib
-        matplotlib.use('Agg')
-        from matplotlib import cm
-        os.makedirs(save_dir, exist_ok=True)
-        # 遍历 lidar2img_dict
-        for lidar_idx, img_indices in lidar2img_dict.items():
-            # 左边 BEV 图
-            bev_img = self.vis_bev_segmentation_style(
-                            voxel_xyz=out_dict['voxel_xyz'],
-                            query_pred=out_dict['query_xyz'],
-                            query_cat=out_dict['query_cat'],
-                            bboxes=bboxes,
-                            scores=scores,
-                            labels=labels,
-                            highlight_idx=lidar_idx,
-                            mask=bevmask,
-                            bev_range=[-50,50,-50,50],
-                            out_size=(512,512)
-                        )
-            # 构造每个相机的选中框
-            filtered_dets = []
-            for cam_id, cam_dets in enumerate(dets):
-                # 找出属于该相机的 topk 图像query框
-                selected = [local_idx for (cid, local_idx) in self.map_global_img_indices(img_indices, dets)
-                            if cid == cam_id]
-                if len(selected) > 0:
-                    selected_tensor = torch.tensor(selected, device=cam_dets.device, dtype=torch.long)
-                    cam_dets_selected = cam_dets[selected_tensor]
-                else:
-                    cam_dets_selected = cam_dets.new_zeros((0, 6))
-                filtered_dets.append(cam_dets_selected)
 
-            # 右边 相机拼图
-            cam_img = vis_dets_2d(img_metas_det, filtered_dets, 0.0, return_img=True)
+        if outs['topk_img_indices'] is not None:
+            from tools.debug_tools.visualize import vis_attention
+            imgs_out_dict = {
+                "img_metas_det": img_metas_det,
+                "dets":dets
+            }
+            vis_attention(fusion_outs=outs,
+                        out_boxes=bbox_list,
+                        pts_out_dict=out_dict,
+                        imgs_out_dict=imgs_out_dict,
+                        save_dir="./vis_lidar_img_pairs_assignment")
 
-            # =========================
-            # 调整 BEV 和相机图比例
-            bev_h, bev_w, _ = bev_img.shape
-            cam_h, cam_w, _ = cam_img.shape
-
-            # 统一高度
-            target_h = max(bev_h, cam_h)
-
-            # BEV 缩放
-            scale_bev = target_h / bev_h
-            bev_w_new = int(bev_w * scale_bev)
-            bev_img_resized = cv2.resize(bev_img, (bev_w_new, target_h))
-
-            # 相机图缩放
-            scale_cam = target_h / cam_h
-            cam_w_new = int(cam_w * scale_cam)
-            cam_img_resized = cv2.resize(cam_img, (cam_w_new, target_h))
-
-            # 拼接
-            canvas = np.ones((target_h, bev_w_new + cam_w_new, 3), dtype=np.uint8) * 255
-            canvas[:, :bev_w_new] = bev_img_resized
-            canvas[:, bev_w_new:bev_w_new + cam_w_new] = cam_img_resized
-
-            # 保存
-            out_path = os.path.join(save_dir, f"lidar_{lidar_idx}.jpg")
-            cv2.imwrite(out_path, canvas)
-            print(f"[INFO] 保存到 {out_path}")
-        
-        # =========================
-        # img_index=outs['top2_img_indices']
-        # selected_boxes, mappings = self.get_2d_boxes_from_indices(dets, img_index)
-        # # 构造每个相机的选中框
-        # filtered_dets = []
-        # for cam_id, cam_dets in enumerate(dets):
-        #     selected = [local_idx for (cid, local_idx) in mappings if cid == cam_id]
-        #     if len(selected) > 0:
-        #         selected_tensor = torch.tensor(selected, device=cam_dets.device, dtype=torch.long)
-        #         cam_dets_selected = cam_dets[selected_tensor]
-        #     else:
-        #         cam_dets_selected = cam_dets.new_zeros((0, 6))
-        #     filtered_dets.append(cam_dets_selected)
-
-        # # 一次性拼成 2×3 大图
-        # save_dir = "./vis_top5"
-        # from tools.debug_tools.visualize import vis_dets_2d
-        # vis_dets_2d(img_metas_det, filtered_dets, 0.4, save_dir)
-        
-        
         bbox_results = [
             bbox3d2result(*bbox)
             for bbox in bbox_list
         ]
         return bbox_results
-    
-    def get_2d_boxes_from_indices(self,dets, img_index):
-        """
-        dets: list of length V, dets[v] is [N,6]
-        img_index: 1D tensor of indices after flattening all dets
-        return: list of selected 2D boxes [M, 6], and (cam_id, local_idx) mapping
-        """
-        device = img_index.device
-        n_per_view = [len(d) for d in dets]       
-        cum_sum = torch.cumsum(torch.tensor([0] + n_per_view, device=device), dim=0)  # 保证在同一设备
-        
-        boxes = []
-        mappings = []
-        for idx in img_index:
-            # idx 是 tensor -> 转成 int 之前要先挪到 cpu
-            cam_id = (cum_sum[1:] > idx).nonzero(as_tuple=False)[0].item()
-            local_idx = idx.item() - cum_sum[cam_id].item()
-            
-            box = dets[cam_id][local_idx]  # [6]
-            boxes.append(box.unsqueeze(0))
-            mappings.append((cam_id, local_idx))
-        
-        return torch.cat(boxes, dim=0), mappings
-
 
     def simple_test(self, img_metas, **data):
         """Test function without augmentaiton."""

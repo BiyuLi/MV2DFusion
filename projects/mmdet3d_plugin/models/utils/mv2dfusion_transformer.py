@@ -431,39 +431,6 @@ class MV2DFusionTransformer(BaseModule):
             dyn_q_pos_with_prob_branch=dyn_q_pos_with_prob_branch,
             dyn_q_prob_branch=dyn_q_prob_branch,
         )
-        # if(self.training==False):
-        #     ptsAndimg_query=out_dec[5]  # [num_query, bs, dim]
-        #     ptsAndimg_query=ptsAndimg_query[:num_query]   # [num_query, 1, 256]
-        #     ptsAndimg_query = ptsAndimg_query.squeeze(1)   # [451, 256]
-        #     device=ptsAndimg_query.device
-        #     #提取QKV投影矩阵
-        #     QKV_proj=self.decoder.layers[5].attentions[0].attn.in_proj_weight
-        #     W_q=QKV_proj[0:256,:]
-        #     W_k=QKV_proj[256:512,:]
-        #     W_q = W_q.to(device)
-        #     W_k = W_k.to(device)
-        #     #提取QK偏执
-        #     QKV_bias=self.decoder.layers[5].attentions[0].attn.in_proj_bias
-        #     b_q = QKV_bias[:256] #Q偏执
-        #     b_k =QKV_bias[256:512]  # K偏置
-        #     b_q = b_q.to(device)
-        #     b_k = b_k.to(device)
-        #     #计算Q和K
-        #     Q = torch.matmul(ptsAndimg_query, W_q.T)
-        #     Q += b_q 
-        #     K = torch.matmul(ptsAndimg_query, W_k.T)
-        #     K += b_k
-        #     #计算注意力相似度
-        #     scale = torch.sqrt(torch.tensor(256, dtype=torch.float, device=device))
-        #     Q_norm = F.normalize(Q, dim=-1)  # [num_query, dim]
-        #     K_norm = F.normalize(K, dim=-1)
-        #     attn_similarity = torch.matmul(Q_norm, K_norm.T) / scale  # shape [num_query, num_query]
-        #     attn_probs = F.softmax(attn_similarity, dim=-1)  # 每个query对其他query的注意力分布
-        #     #排除自身相似度  
-        #     attn_probs = attn_probs.fill_diagonal_(-float('inf'))
-        #     top2_scores, top2_indices = torch.topk(attn_probs, k=2, dim=1)  # 每个query的前2个
-        #     # 9.筛选每个query的前2个相似query（带阈值过滤）
-            
         out_dec = out_dec.transpose(1, 2).contiguous()
         return out_dec, reference, dyn_q_logits
 

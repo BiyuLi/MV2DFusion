@@ -473,7 +473,8 @@ model = dict(
             alpha=0.25,
             loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
-        loss_iou=dict(type='GIoULoss', loss_weight=0.0), ),
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0),
+        enable_matching=True),  # 实验内容：是否开启lidar query和imag query匹配
     train_cfg=dict(fusion=dict(
         grid_size=[512, 512, 1],
         voxel_size=voxel_size,

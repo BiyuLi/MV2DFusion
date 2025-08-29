@@ -108,6 +108,7 @@ class MV2DFusionHead(AnchorFreeHead):
                  # init config
                  init_cfg=None,
                  debug=False,
+                 enable_matching=False,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -219,6 +220,8 @@ class MV2DFusionHead(AnchorFreeHead):
         self.fp16_enabled = False
 
         self.debug = debug
+        
+        self.enable_matching = enable_matching
 
     def _init_layers(self):
         """Initialize layers of the transformer head."""
@@ -455,13 +458,13 @@ class MV2DFusionHead(AnchorFreeHead):
         if self.with_ego_pos:
             rec_ego_motion = torch.cat(# 构建当前帧的自我运动特征（包含位置和姿态变换）
                 [torch.zeros_like(reference_points[..., :3]), rec_ego_pose[..., :3, :].flatten(-2)], dim=-1)
-            rec_ego_motion = nerf_positional_encoding(rec_ego_motion)# 对自我运动特征进行NERF风格的位置编码（增强高维表达）
-            tgt = self.ego_pose_memory(tgt, rec_ego_motion)# 用自我运动信息更新当前帧的目标特征和查询位置编码
+            rec_ego_motion = nerf_positional_encoding(rec_ego_motion)# 对自车运动特征进行NERF风格的位置编码（增强高维表达）
+            tgt = self.ego_pose_memory(tgt, rec_ego_motion)# 用自车运动信息更新当前帧的目标特征和查询位置编码
             query_pos = self.ego_pose_pe(query_pos, rec_ego_motion)
-            memory_ego_motion = torch.cat(#[1,3072,15]# 构建历史记忆的自我运动特征（包含速度、时间戳、姿态）
+            memory_ego_motion = torch.cat(#[1,3072,15]# 构建历史记忆的自车运动特征（包含速度、时间戳、姿态）
                 [self.memory_velo, self.memory_timestamp, self.memory_egopose[..., :3, :].flatten(-2)], dim=-1).float()
             memory_ego_motion = nerf_positional_encoding(memory_ego_motion)#[1, 3072, 180]
-            temp_pos = self.ego_pose_pe(temp_pos, memory_ego_motion)#[1, 3072, 256]# 用历史自我运动信息更新历史记忆的位置编码和特征
+            temp_pos = self.ego_pose_pe(temp_pos, memory_ego_motion)#[1, 3072, 256]# 用历史自车运动信息更新历史记忆的位置编码和特征
             temp_memory = self.ego_pose_memory(temp_memory, memory_ego_motion)#[1, 3072, 256]
 
         query_pos += self.time_embedding(pos2posemb1d(torch.zeros_like(reference_points[..., :1])))
@@ -703,7 +706,7 @@ class MV2DFusionHead(AnchorFreeHead):
         tgt_size = self.num_query + self.num_propagated # 目标查询尺寸（当前帧+传播的历史查询）
         src_size = self.num_query + self.memory_len# 源查询尺寸（当前帧+记忆库查询）
         if attn_mask is None:
-            attn_mask = torch.zeros((tgt_size, src_size), dtype=torch.bool, device=reference_points.device)
+            attn_mask = torch.zeros((tgt_size, src_size), dtype=torch.bool, device=reference_points.device) #(当前目标数，当前+历史目标数）
         pad_size = attn_mask.size(0) - tgt_size #填充尺寸（用于对齐长度）
         if mask_dict is not None:
             assert pad_size == mask_dict['pad_size']
@@ -722,7 +725,7 @@ class MV2DFusionHead(AnchorFreeHead):
         pts_query_feat = self.pts_query_embed(pts_query_feat)# 点云查询特征嵌入
         pad_query_feats[:, pad_size:pad_size + num_query_pts] = pts_query_feat# 填充点云和图像的查询特征
         pad_query_feats[:, pad_size + num_query_pts:pad_size + self.num_query] = query_feats
-        tgt = self.dyn_q_enc(tgt, pad_query_feats)# 编码查询特征（可能是一个线性层或小网络）
+        tgt = self.dyn_q_enc(tgt, pad_query_feats)# 编码查询特征, learnable gamma/beta
 
         # query positional encoding# 生成查询的位置编码（基于参考点的3D位置）
         query_pos = self.query_embedding(pos2posemb3d(reference_points))
@@ -805,8 +808,12 @@ class MV2DFusionHead(AnchorFreeHead):
             # 最终过滤：无效框的分数设为-40，坐标设为0
             all_cls_scores[:, :, pad_size:][:, ~tgt_query_mask] = -40
             all_bbox_preds[:, :, pad_size:][:, ~tgt_query_mask] = 0
+
+        # ========== 以下是实验内容：2D和3D匹配 =============
+        topk_img_indices = None
+        lidar2img_dict=None
         
-        if(self.training==False):
+        if self.enable_matching and not self.training:
             from scipy.optimize import linear_sum_assignment
             # 取最后一层解码器输出: [num_query, D]
             last_dec = outs_dec[-1][0, :self.num_query]   # [num_query, D]
@@ -889,13 +896,12 @@ class MV2DFusionHead(AnchorFreeHead):
                 row_ind, col_ind =self.km_max_weight_match(fused_matrix.detach().cpu().numpy())
 
                 # --- 保存匹配结果 ---
-                # --- 保存匹配结果 ---
                 for r_i, c_j in zip(row_ind, col_ind):
                     lidar_qidx = lidar_idx[r_i].item()
                     img_qidx = c_j    # 转回全局索引
                     lidar2img_dict[lidar_qidx] = [img_qidx]   # ✅ 必须用 list
             else:
-                lidar_top2_scores, lidar_topk_indices = None, None
+                lidar_topk_scores, lidar_topk_indices = None, None
 
             # --- 图像 → 图像 (Q: 过滤后图像, K: 全部图像，不含自身) ---
             if img_idx.numel() > 0:
@@ -909,21 +915,24 @@ class MV2DFusionHead(AnchorFreeHead):
                 probs = F.softmax(attn_img2img, dim=-1)
 
                 k = 2 if K_img_all.shape[0] >= 2 else 1
-                img_top2_scores, img_top2_indices = torch.topk(probs, k=k, dim=1)
+                img_topk_scores, img_topk_indices = torch.topk(probs, k=k, dim=1)
                 
             else:
-                img_top2_scores, img_top2_indices = None, None
+                img_topk_scores, img_topk_indices = None, None
             
-            top2_indices_list = []
+            topk_indices_list = []
             if lidar_topk_indices is not None:
-                top2_indices_list.append(lidar_topk_indices.flatten())
-            if img_top2_indices is not None:
-                top2_indices_list.append(img_top2_indices.flatten())
-            if len(top2_indices_list) > 0:
-                all_top2_img_indices = torch.cat(top2_indices_list)       # 拼接
-                all_top2_img_indices = torch.unique(all_top2_img_indices) # 去重
+                topk_indices_list.append(lidar_topk_indices.flatten())
+            if img_topk_indices is not None:
+                topk_indices_list.append(img_topk_indices.flatten())
+            if len(topk_indices_list) > 0:
+                topk_img_indices = torch.cat(topk_indices_list)       # 拼接
+                topk_img_indices = torch.unique(topk_img_indices) # 去重
             else:
-                all_top2_img_indices = torch.tensor([], device=device, dtype=torch.long)
+                topk_img_indices = torch.tensor([], device=device, dtype=torch.long)
+        
+        # ========== 实验内容结束：2D和3D匹配 =============
+        
         # update the memory bank# 更新记忆库：将当前帧的预测结果存入记忆库，供后续帧使用
         self.post_update_memory(data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict,
                                 query_mask=tgt_query_mask, instance_inds=None, )
@@ -943,7 +952,7 @@ class MV2DFusionHead(AnchorFreeHead):
             'dyn_cls_scores': all_cls_scores,# 动态查询的类别分数（与all_cls_scores一致）
             'dyn_bbox_preds': all_bbox_preds,# 动态查询的边界框预测
             'dn_mask_dict': mask_dict,# 去噪训练的掩码信息
-            'top2_img_indices': all_top2_img_indices, # 新增：去重后的 top2 图像 query 索引
+            'topk_img_indices': topk_img_indices, # 新增：去重后的 topk 图像 query 索引
             'lidar2img_dict':lidar2img_dict,
             'tgt_query_mask':tgt_query_mask[0][:num_query_pts],
         }
