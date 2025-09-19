@@ -683,9 +683,7 @@ class MV2DFusion(MVXTwoStageDetector):
         # image query generation
         dets2d, dets = self.forward_roi_head(imgs_det, feats_det, img_metas_det)
         # dets: dets[cam_idx] = [n_dets, 6]  6: [x1, x2, y1, y2, score, cls]
-        
         if False:
-        # debug: vis roi detections
             from tools.debug_tools.visualize import vis_dets_2d
             vis_dets_2d(img_metas_det, dets, 0.5, "./vis_det2d_0.5")
         if self.use_2d_proposal:
@@ -713,20 +711,25 @@ class MV2DFusion(MVXTwoStageDetector):
 
         outs = self.fusion_bbox_head(img_metas, dyn_query=dyn_query, dyn_feats=dyn_feats,
                                   pts_query_center=pts_query_center, pts_query_feat=pts_query_feat, pts_feat=pts_feat,
-                                  pts_pos=pts_pos, pts_shape=None, **data)
+                                  pts_pos=pts_pos, dets=dets,pts_shape=None, **data)
         bbox_list = self.fusion_bbox_head.get_bboxes(outs, img_metas)
 
-        if outs['topk_img_indices'] is not None:
-            from tools.debug_tools.visualize import vis_attention
-            imgs_out_dict = {
-                "img_metas_det": img_metas_det,
-                "dets":dets
-            }
-            vis_attention(fusion_outs=outs,
-                        out_boxes=bbox_list,
-                        pts_out_dict=out_dict,
-                        imgs_out_dict=imgs_out_dict,
-                        save_dir="./vis_lidar_img_pairs_assignment")
+        # if outs['topk_img_indices'] is not None:
+        #     from tools.debug_tools.visualize import vis_attention
+        #     imgs_out_dict = {
+        #         "img_metas_det": img_metas_det,
+        #         "dets":dets
+        #     }
+
+        #     import datetime
+        #     import os
+        #     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # 精确到微秒
+        #     save_dir = os.path.join("./vis_lidar_img_pairs_assignment-test2222", timestamp)
+        #     vis_attention(fusion_outs=outs,
+        #                 out_boxes=bbox_list,
+        #                 pts_out_dict=out_dict,
+        #                 imgs_out_dict=imgs_out_dict,
+        #                 save_dir=save_dir)
 
         bbox_results = [
             bbox3d2result(*bbox)
@@ -771,8 +774,12 @@ class MV2DFusion(MVXTwoStageDetector):
             img_metas[0][i]['lidar2img'] = data['lidar2img'][i].cpu().numpy()
             img_metas[0][i]['intrinsics'] = data['intrinsics'][i].cpu().numpy()
             img_metas[0][i]['extrinsics'] = data['extrinsics'][i].cpu().numpy()
-        results = self.simple_test(img_metas[0], **data)
-        return results
+        results = self.simple_test(img_metas[0], **data)#[{'pts_bbox': {...}}]
+        wrapped_results = [{
+            'detections': results[0],  # 原始检测结果列表
+            'lidar2img': img_metas[0][0]['lidar2img'],
+        }]
+        return wrapped_results
 
     @force_fp32(apply_to=('img'))
     def forward(self, return_loss=True, **data):

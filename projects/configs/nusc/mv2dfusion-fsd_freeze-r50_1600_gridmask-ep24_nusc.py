@@ -553,6 +553,7 @@ train_pipeline = [
              'filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d',
              'img_norm_cfg', 'scene_token', 'gt_bboxes_3d', 'gt_labels_3d'), )
 ]
+
 test_pipeline = [
     dict(
         type='LoadPointsFromFile',
@@ -591,7 +592,61 @@ test_pipeline = [
                             'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d', 'gt_labels_3d'))
         ])
 ]
-
+# 验证Pipeline（专门用于加载输入+真值）
+val_pipeline = [
+    # 1. 加载点云（与测试一致）
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=9,
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        pad_empty_sweeps=True,
+        remove_close=True,
+        file_client_args=file_client_args),
+    
+    # 2. 加载3D标注（仅在验证阶段需要）
+    dict(
+        type='LoadAnnotations3D',
+        with_bbox_3d=True,
+        with_label_3d=True
+    ),
+    
+    # 3. 加载图像（与测试一致）
+    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=False),
+    dict(type='NormalizeMultiviewImage',** img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='NormalizePoints'),
+    
+    # 4. 格式转换（保留标签）
+    dict(
+        type='MultiScaleFlipAug3D',
+        img_scale=(1333, 800),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(
+                type='PETRFormatBundle3D',
+                collect_keys=collect_keys + ['prev_exists'],
+                class_names=class_names,
+                with_label=True  # 关键：保留标签信息
+            ),
+            dict(
+                type='Collect3D',
+                keys=['points', 'img', 'prev_exists', 'gt_bboxes_3d', 'gt_labels_3d'] + collect_keys,
+                meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 
+                           'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d',
+                           'img_norm_cfg', 'scene_token')
+            )
+        ])
+]
 data = dict(
     samples_per_gpu=batch_size,
     workers_per_gpu=4,
@@ -613,12 +668,13 @@ data = dict(
         box_type_3d='LiDAR'),
     val=dict(
         type=dataset_type,
-        pipeline=test_pipeline,
-        collect_keys=collect_keys + ['img', 'img_metas'],
+        pipeline=val_pipeline,  # 使用上面定义的验证Pipeline
+        collect_keys=collect_keys + ['img', 'img_metas','gt_bboxes_3d', 'gt_labels_3d'],
         queue_length=queue_length,
-        ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl',
+        ann_file='/home/manager/projects/xzh/MV2DFusion/data/nuscenes/nuscenes_mini_val_temporal_infos_val_new.pkl',
         classes=class_names,
-        modality=input_modality),
+        modality=input_modality,
+        test_mode=False),
     test=dict(
         type=dataset_type,
         pipeline=test_pipeline,

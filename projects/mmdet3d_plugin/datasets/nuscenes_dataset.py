@@ -404,7 +404,128 @@ class CustomNuScenesDataset(NuScenesDataset):
             
         return input_dict
 
+    def get_ann_info(self, index):
+        info = self.data_infos[index]
+        annos = super().get_ann_info(index)
 
+        # 1. 提取标注数据
+        bboxes3d_cams_list = info.get('bboxes3d_cams', [])
+        gt_names = info.get('gt_names', [])
+        cat2id = self.cat2id
+        gt_bboxes_3d = []
+        gt_labels_3d = []
+        cam_names = list(info['cams'].keys())
+
+        # 辅助函数：欧拉角（roll, pitch, yaw）转四元数
+        def euler_to_quaternion(roll, pitch, yaw):
+            cr = np.cos(roll * 0.5)
+            sr = np.sin(roll * 0.5)
+            cp = np.cos(pitch * 0.5)
+            sp = np.sin(pitch * 0.5)
+            cy = np.cos(yaw * 0.5)
+            sy = np.sin(yaw * 0.5)
+            w = cr * cp * cy + sr * sp * sy
+            x = sr * cp * cy - cr * sp * sy
+            y = cr * sp * cy + sr * cp * sy
+            z = cr * cp * sy - sr * sp * cy
+            return np.array([w, x, y, z], dtype=np.float32)
+
+        # 四元数乘法
+        def quaternion_multiply(q1, q2):
+            w1, x1, y1, z1 = q1
+            w2, x2, y2, z2 = q2
+            w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+            x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+            y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+            z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+            return np.array([w, x, y, z], dtype=np.float32)
+
+        # 四元数归一化
+        def quaternion_normalize(q):
+            norm = np.linalg.norm(q)
+            if norm < 1e-8:
+                return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            return q / norm
+
+        # 四元数转旋转矩阵
+        def quaternion_to_rotation_matrix(q):
+            w, x, y, z = q
+            r = np.array([
+                [1-2*y**2-2*z**2, 2*x*y-2*z*w, 2*x*z+2*y*w],
+                [2*x*y+2*z*w, 1-2*x**2-2*z**2, 2*y*z-2*x*w],
+                [2*x*z-2*y*w, 2*y*z+2*x*w, 1-2*x**2-2*y**2]
+            ], dtype=np.float32)
+            return r
+
+        for cam_idx, (bboxes3d_cam, cam_name) in enumerate(zip(bboxes3d_cams_list, cam_names)):
+            if len(bboxes3d_cam) == 0:
+                continue
+
+            cam_info = info['cams'][cam_name]
+            rot = np.asarray(cam_info['sensor2lidar_rotation'], dtype=np.float32)
+            if rot.size == 3:
+                # 欧拉角情况
+                roll, pitch, yaw = rot
+                cam_quat = euler_to_quaternion(roll, pitch, yaw)
+                cam_quat = quaternion_normalize(cam_quat)
+                cam2lidar_r = quaternion_to_rotation_matrix(cam_quat)
+            elif rot.size == 9:
+                # 已经是旋转矩阵
+                cam2lidar_r = rot.reshape(3,3)
+                cam_quat = None  # 旋转矩阵情况下不使用四元数
+            else:
+                print(f"sensor2lidar_rotation shape={rot.shape} 不支持，跳过")
+                continue
+
+            cam2lidar_t = np.array(cam_info['sensor2lidar_translation'], dtype=np.float32).reshape(3,1)
+            cam2lidar_rt = np.hstack([cam2lidar_r, cam2lidar_t])
+            cam2lidar_rt = np.vstack([cam2lidar_rt, [0,0,0,1]])
+
+            for bbox_cam in bboxes3d_cam:
+                x_cam, y_cam, z_cam, l, w, h, yaw_cam = bbox_cam
+                center_cam = np.array([x_cam, y_cam, z_cam], dtype=np.float32).reshape(3,1)
+                center_cam_hom = np.vstack([center_cam, 1])
+                center_lidar = (cam2lidar_rt @ center_cam_hom)[:3].flatten()
+
+                # 旋转
+                if cam_quat is not None:
+                    yaw_quat = euler_to_quaternion(0,0,yaw_cam)
+                    lidar_quat = quaternion_multiply(cam_quat, yaw_quat)
+                    lidar_quat = quaternion_normalize(lidar_quat)
+                else:
+                    # 旋转矩阵情况下
+                    cz = np.cos(yaw_cam)
+                    sz = np.sin(yaw_cam)
+                    yaw_rot = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]], dtype=np.float32)
+                    lidar_rot = cam2lidar_r @ yaw_rot
+                    # 转回四元数
+                    w = np.sqrt(1 + lidar_rot[0,0] + lidar_rot[1,1] + lidar_rot[2,2]) / 2
+                    x = (lidar_rot[2,1]-lidar_rot[1,2])/(4*w)
+                    y = (lidar_rot[0,2]-lidar_rot[2,0])/(4*w)
+                    z = (lidar_rot[1,0]-lidar_rot[0,1])/(4*w)
+                    lidar_quat = np.array([w,x,y,z], dtype=np.float32)
+
+                bbox_lidar = [
+                    center_lidar[0], center_lidar[1], center_lidar[2],
+                    l, w, h,
+                    lidar_quat[0], lidar_quat[1], lidar_quat[2], lidar_quat[3]
+                ]
+                gt_bboxes_3d.append(bbox_lidar)
+
+                target_idx = len(gt_labels_3d)
+                if target_idx < len(gt_names):
+                    class_name = gt_names[target_idx].strip().lower()
+                    if class_name in cat2id:
+                        gt_labels_3d.append(cat2id[class_name])
+
+        annos.update({
+            'gt_bboxes_3d': np.array(gt_bboxes_3d, dtype=np.float32) if gt_bboxes_3d else np.zeros((0,10)),
+            'gt_labels_3d': np.array(gt_labels_3d, dtype=np.int32) if gt_labels_3d else np.array([], dtype=np.int32),
+            'box_mode_3d': 'LiDAR',
+            'box_type_3d': 'NuScenesBox'
+        })
+
+        return annos
     def __getitem__(self, idx):
         """Get item from infos according to the given index.
         Returns:

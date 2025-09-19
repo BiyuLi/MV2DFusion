@@ -222,7 +222,18 @@ def get_2d_boxes_from_indices(dets, img_index):
         mappings.append((cam_id, local_idx))
     
     return torch.cat(boxes, dim=0), mappings
-
+def map_global_img_index(global_idx, dets):
+    """
+    输入一个 global_idx，返回 (cam_id, local_idx)
+    """
+    count = 0
+    for cam_id, cam_dets in enumerate(dets):
+        num = len(cam_dets)
+        if global_idx < count + num:
+            local_idx = global_idx - count
+            return cam_id, local_idx
+        count += num
+    raise IndexError(f"global_idx={global_idx} 超出范围，总检测数={count}")
 def map_global_img_indices(global_indices, dets):
     """
     把 flatten 之后的全局索引映射到 (cam_id, local_idx)
@@ -326,9 +337,93 @@ def vis_bev_segmentation_style(voxel_xyz,
     return bev_img
 
 
-def vis_attention(fusion_outs, out_boxes, pts_out_dict, imgs_out_dict, save_dir):
+# def vis_attention(fusion_outs, out_boxes, pts_out_dict, imgs_out_dict,save_dir):
+#     # {lidar_idx: [img_query_indices]}
+#     lidar2img_dict = fusion_outs['lidar2img_dict']
+#     bevmask = fusion_outs['tgt_query_mask']
+#     img_metas_det = imgs_out_dict['img_metas_det']
+#     dets = imgs_out_dict['dets']
+    
+#     # 先获取 3D 检测结果
+#     bboxes, scores, labels = out_boxes[0]  # batch=0
+#     os.makedirs(save_dir, exist_ok=True)
+#     # 遍历 lidar2img_dict
+#     for lidar_idx, img_indices in lidar2img_dict.items():
+#         # 左边 BEV 图
+#         bev_img = vis_bev_segmentation_style(
+#             voxel_xyz=pts_out_dict['voxel_xyz'],
+#             query_pred=pts_out_dict['query_xyz'],
+#             query_cat=pts_out_dict['query_cat'],
+#             bboxes=bboxes,
+#             scores=scores,
+#             labels=labels,
+#             highlight_idx=lidar_idx,
+#             mask=bevmask,
+#             bev_range=[-50, 50, -50, 50],
+#             out_size=(512, 512)
+#         )
+#         # 构造每个相机的选中框
+#         filtered_dets = []
+#         for cam_id, cam_dets in enumerate(dets):
+#             # 找出属于该相机的 topk 图像query框
+#             selected = [local_idx for (cid, local_idx) in map_global_img_indices(img_indices, dets)
+#                         if cid == cam_id]
+#             if len(selected) > 0:
+#                 selected_tensor = torch.tensor(
+#                     selected, device=cam_dets.device, dtype=torch.long)
+#                 cam_dets_selected = cam_dets[selected_tensor]
+#             else:
+#                 cam_dets_selected = cam_dets.new_zeros((0, 6))
+#             filtered_dets.append(cam_dets_selected)
+
+#         # 右边 相机拼图
+#         cam_img = vis_dets_2d(
+#             img_metas_det, filtered_dets, 0.0, return_img=True)
+
+#         # =========================
+#         # 调整 BEV 和相机图比例
+#         bev_h, bev_w, _ = bev_img.shape
+#         cam_h, cam_w, _ = cam_img.shape
+
+#         # 统一高度
+#         target_h = max(bev_h, cam_h)
+
+#         # BEV 缩放
+#         scale_bev = target_h / bev_h
+#         bev_w_new = int(bev_w * scale_bev)
+#         bev_img_resized = cv2.resize(bev_img, (bev_w_new, target_h))
+
+#         # 相机图缩放
+#         scale_cam = target_h / cam_h
+#         cam_w_new = int(cam_w * scale_cam)
+#         cam_img_resized = cv2.resize(cam_img, (cam_w_new, target_h))
+
+#         # 拼接
+#         canvas = np.ones((target_h, bev_w_new + cam_w_new, 3),
+#                          dtype=np.uint8) * 255
+#         canvas[:, :bev_w_new] = bev_img_resized
+#         canvas[:, bev_w_new:bev_w_new + cam_w_new] = cam_img_resized
+
+#         # 保存
+#         out_path = os.path.join(save_dir, f"lidar_{lidar_idx}.jpg")
+#         cv2.imwrite(out_path, canvas)
+#         print(f"[INFO] 保存到 {out_path}")
+# dets 是一个 list，每个相机一个 tensor: [N, 6] (x1, y1, x2, y2, score, class_id)
+
+def get_cat_from_dets(dets, global_idx):
+    # dets 是 [cam0_dets, cam1_dets, ...]
+    # global_idx 需要先映射成 (cam_id, local_idx)
+    cam_id, local_idx = map_global_img_index(global_idx, dets)  
+
+    if local_idx < len(dets[cam_id]):
+        return cam_id,int(dets[cam_id][local_idx, -1].item())  # class_id 在最后一列
+    else:
+        print(f"[WARN] local_idx={local_idx} 超出相机 {cam_id} 的检测数 {len(dets[cam_id])}")
+        return -1
+def vis_attention(fusion_outs, out_boxes, pts_out_dict, imgs_out_dict,save_dir):
     # {lidar_idx: [img_query_indices]}
     lidar2img_dict = fusion_outs['lidar2img_dict']
+    lidar2img_points_dict=fusion_outs['lidar2img_points_dict']
     bevmask = fusion_outs['tgt_query_mask']
     img_metas_det = imgs_out_dict['img_metas_det']
     dets = imgs_out_dict['dets']
@@ -338,6 +433,27 @@ def vis_attention(fusion_outs, out_boxes, pts_out_dict, imgs_out_dict, save_dir)
     os.makedirs(save_dir, exist_ok=True)
     # 遍历 lidar2img_dict
     for lidar_idx, img_indices in lidar2img_dict.items():
+        top1, top2 = img_indices[:2]
+        # === 获取对应的 points ===
+        points = lidar2img_points_dict[lidar_idx]  # [TopN, 3]
+        pt1, pt2 = points[0], points[1]
+        # === 获取相机ID和对应的类别（从 query_cat） ===
+        cid1,cat1 = get_cat_from_dets(dets, top1)
+        cid2,cat2 = get_cat_from_dets(dets, top2)
+        # === 检查过滤条件 ===
+        keep_top2 = True
+        if cid1 == cid2:  # 同一个相机
+            keep_top2 = False
+        elif torch.norm(pt1 - pt2).item() > 0.06:  # 点太远
+            keep_top2 = False
+        elif cat1 != cat2:  # 类别不同
+            keep_top2 = False
+
+        # === 构造最终的候选 indices ===
+        filtered_indices = [top1]
+        if keep_top2:
+            filtered_indices.append(top2)
+
         # 左边 BEV 图
         bev_img = vis_bev_segmentation_style(
             voxel_xyz=pts_out_dict['voxel_xyz'],
@@ -355,7 +471,7 @@ def vis_attention(fusion_outs, out_boxes, pts_out_dict, imgs_out_dict, save_dir)
         filtered_dets = []
         for cam_id, cam_dets in enumerate(dets):
             # 找出属于该相机的 topk 图像query框
-            selected = [local_idx for (cid, local_idx) in map_global_img_indices(img_indices, dets)
+            selected = [local_idx for (cid, local_idx) in map_global_img_indices(filtered_indices, dets)
                         if cid == cam_id]
             if len(selected) > 0:
                 selected_tensor = torch.tensor(
@@ -397,7 +513,6 @@ def vis_attention(fusion_outs, out_boxes, pts_out_dict, imgs_out_dict, save_dir)
         out_path = os.path.join(save_dir, f"lidar_{lidar_idx}.jpg")
         cv2.imwrite(out_path, canvas)
         print(f"[INFO] 保存到 {out_path}")
-
     # =========================
     # img_index=fusion_outs['topk_img_indices']
     # selected_boxes, mappings = get_2d_boxes_from_indices(dets, img_index)

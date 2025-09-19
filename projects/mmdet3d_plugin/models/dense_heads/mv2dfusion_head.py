@@ -103,7 +103,7 @@ class MV2DFusionHead(AnchorFreeHead):
                  prob_bin=50,
                  # nms config
                  post_bev_nms_thr=0.2,
-                 post_bev_nms_score=0.4,
+                 post_bev_nms_score=0.0,
                  post_bev_nms_ops=[],
                  # init config
                  init_cfg=None,
@@ -650,7 +650,7 @@ class MV2DFusionHead(AnchorFreeHead):
         return pts_ref
 
     def forward(self, img_metas, dyn_query=None, dyn_feats=None,
-                pts_query_center=None, pts_query_feat=None, pts_feat=None, pts_pos=None, **data):
+                pts_query_center=None, pts_query_feat=None, pts_feat=None, pts_pos=None,dets=None, **data):
 
         # zero init the memory bank# 初始化记忆库
         self.pre_update_memory(data)
@@ -774,6 +774,7 @@ class MV2DFusionHead(AnchorFreeHead):
         # 堆叠所有层的预测结果
         all_cls_scores = torch.stack(outputs_classes)
         all_bbox_preds = torch.stack(outputs_coords)
+        points_query=copy.deepcopy(all_bbox_preds[-1][0][:self.num_query, :3])
         all_bbox_preds[..., 0:3] = (# 将归一化的坐标反归一化到实际点云范围（pc_range：点云的x/y/z最小值和最大值）
                     all_bbox_preds[..., 0:3] * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3])
 
@@ -798,7 +799,7 @@ class MV2DFusionHead(AnchorFreeHead):
                    # 对所有预测框执行NMS
                     all_boxes = bbox_bev[i]#[754, 5]
                     all_scores = score_bev[i]#[754]
-                     # 转换BEV框格式并执行NMS
+                    # 转换BEV框格式并执行NMS
                     keep = nms_bev(xywhr2xyxyr(all_boxes), all_scores, iou_thr, pre_max_size=None, post_max_size=None)
                     nms_tgt_query_mask[i, :][keep] = 1# 标记保留的框
                     nms_tgt_query_mask[i, :][all_scores == 0] = 0# 过滤低分数
@@ -808,11 +809,9 @@ class MV2DFusionHead(AnchorFreeHead):
             # 最终过滤：无效框的分数设为-40，坐标设为0
             all_cls_scores[:, :, pad_size:][:, ~tgt_query_mask] = -40
             all_bbox_preds[:, :, pad_size:][:, ~tgt_query_mask] = 0
-
         # ========== 以下是实验内容：2D和3D匹配 =============
         topk_img_indices = None
         lidar2img_dict=None
-        
         if self.enable_matching and not self.training:
             from scipy.optimize import linear_sum_assignment
             # 取最后一层解码器输出: [num_query, D]
@@ -820,19 +819,20 @@ class MV2DFusionHead(AnchorFreeHead):
             device = last_dec.device
             Q_total, D = last_dec.shape
             points=reference_points[-1][0]
-            # QK 投影参数
-            attn_mod = self.transformer.decoder.layers[-1].attentions[0].attn
-            W = attn_mod.in_proj_weight.to(device)      # [3D, D]
-            b = attn_mod.in_proj_bias.to(device)        # [3D]
-            W_q, W_k = W[0:D, :], W[D:2*D, :]
-            b_q, b_k = b[0:D], b[D:2*D]
+            # points=points_query
             scale = torch.sqrt(torch.tensor(D, dtype=torch.float, device=device))
 
             # --- Step1: 计算所有图像 query 的 K（不过滤） ---
             # K_img_all = torch.matmul(last_dec[num_query_pts:], W_k.T) + b_k   # [N_img_all, D]
             K_img_all=last_dec[num_query_pts:]
-            # K_img_all = F.normalize(K_img_all, dim=-1)
-
+            # === 新增: 基于 dets 分数过滤 ===
+            valid_img_mask = []
+            for cam_id, cam_dets in enumerate(dets):  # dets[cam_id]: [n, 6]
+                scores = cam_dets[:, 4]  # 得到分数
+                keep = scores >= 0.0     # [n]
+                valid_img_mask.append(keep)
+            # 拼接成全局 mask
+            valid_img_mask = torch.cat(valid_img_mask, dim=0)  
             # --- Step2: 过滤有效 query，并计算 Q ---
             valid_mask = tgt_query_mask[0, :self.num_query]       # [num_query]
             feats = last_dec[valid_mask]                          # [N_valid, D]
@@ -849,59 +849,112 @@ class MV2DFusionHead(AnchorFreeHead):
             img_idx    = idx_map[img_mask]     # 有效图像 query 原始索引
 
             # --- 雷达 → 图像 (Q: 过滤后雷达, K: 全部图像) ---
-            alpha = 12.0  # 可调节超参数
-            center = torch.zeros(points.shape[-1], device=device)
+            lidar_points = points[lidar_idx]
+            img_points = points[num_query_pts:self.num_query]
+            dists_all = torch.norm(
+                lidar_points[:, None, :] - img_points[None, :, :],
+                dim=-1
+            )
+            dists_min = dists_all.min(dim=1, keepdim=True)[0]  # [N_lidar, 1]
+            dists_max = dists_all.max(dim=1, keepdim=True)[0]  # [N_lidar, 1]
+            dists_norm = (dists_all - dists_min) / (dists_max - dists_min + 1e-9)  # [N_lidar, N_img]
+            dist_sim_all = 1 - dists_norm  # 相似度：越近越大
+            # dist_sim_all[dists_all > 0.2] = 0
+            alpha = 15.0  # 可调节超参数
+            center = torch.tensor([0.5, 0.5, 0.625], device=device).expand(points.shape[-1])
             lidar2img_dict = {}
-            lidar2img_dist_dict = {}
-            lidar2img_fusedscore = {}
+            lidar2img_points_dict = {}  # 匹配图像的参考点（原逻辑保留）
+            # 初始化：存储每个雷达query在6个相机中的匹配结果（(图像全局索引, 融合得分)）
+            radar_cam_matches = {lid_idx.item(): [] for lid_idx in lidar_idx} if lidar_idx.numel() > 0 else {}
             if lidar_idx.numel() > 0:
                 Q_lidar = Q_all[lidar_mask]                       # [Nr, D]
                 attn_lidar2img = torch.matmul(Q_lidar, K_img_all.T)    # [Nr, N_img_all]
+                attn_lidar2img[:, ~valid_img_mask] = -1e9
+                # attn_lidar2img[dists_all > 0.3] = -1e9
+
                 probs = F.softmax(attn_lidar2img, dim=-1)
+                start=0
+                for cam_id in range(6):
+                    n_cam=dets[cam_id].shape[0]
+                    end = start + n_cam
+                     # 处理无检测结果的相机（跳过，避免后续计算错误）
+                    if n_cam == 0:
+                        start = end
+                        continue
+                    # 提取当前相机的相似度概率：[Nr, n_cam]
+                    probs_cam=probs[:,start:end]
+                    k_cam = 10 if n_cam >= 10 else n_cam
+                    cam_topk_scores, cam_topk_indices = torch.topk(probs_cam, k=k_cam, dim=1)  # [Nr, k_cam]
 
-                k = 20 if K_img_all.shape[0] >= 20 else 1
-                lidar_topk_scores, lidar_topk_indices  = torch.topk(probs, k=k, dim=1)
-                # --- 构造 cost_matrix [Nr, N_img_all] ---
-                Nr = lidar_idx.shape[0]
-                Nimg = K_img_all.shape[0]
-                fused_matrix = torch.full((Nr, Nimg), -1e6, device=device)
-                for i, q_idx in enumerate(lidar_idx.tolist()):
-                    topk_img_global = lidar_topk_indices[i].tolist()  # 候选全局索引
-                    sim_scores = lidar_topk_scores[i]                 # 相似度得分 [k]
-                    
-                    lidar_point = points[q_idx]
-                    img_points = points[num_query_pts +torch.tensor(topk_img_global, device=device)]
-                    dists = torch.norm(lidar_point.unsqueeze(0) - img_points, dim=-1)  # [k]
-                    
-                    # === Step1: logit变换相似度 ===
-                    sim_scores_logit = torch.log(sim_scores / (1 - sim_scores + 1e-9))
+                    # --- 构造 cost_matrix [Nr, N_img_all] ---
+                    # 构造当前相机的融合矩阵：[Nr, N_img_all]（仅当前相机范围有值，其余为-1e6）
+                    fused_matrix_cam = torch.full((lidar_idx.shape[0], K_img_all.shape[0]), -1e6, device=device)
+                    for radar_idx_in_valid, lid_original_idx in enumerate(lidar_idx.tolist()):
+                        #计算当前雷达query的候选图像索引（转换为全局索引）
+                        cam_topk_global_idx = start+cam_topk_indices[radar_idx_in_valid]  # [k_cam]
+                        # 提取相似度得分和距离
+                        sim_scores = cam_topk_scores[radar_idx_in_valid]  # [k_cam]：当前相机的相似度得分
+                        eps = 1e-6
+                        sim_scores_clamped = sim_scores.clamp(min=eps, max=1-eps)
+                        sim_scores_logit = torch.log(sim_scores_clamped / (1 - sim_scores_clamped))
 
-                    # === Step2: 距离归一化 ===
-                    dist_norm = (dists - dists.min()) / (dists.max() - dists.min() + 1e-9)
-                    dist_sim = 1 - dist_norm  
+                        lidar_point = points[lid_original_idx]
+                        # 从全局距离矩阵里取对应的相似度
+                        dist_sim = dist_sim_all[radar_idx_in_valid, cam_topk_global_idx]  # [k_cam]
+      
+                        # === Step1: logit变换相似度 ===
+                        # sim_scores_logit= (sim_scores_logit - sim_scores_logit.min()) / (sim_scores_logit.max() - sim_scores_logit.min() + 1e-9)
+    
 
-                    # === Step3: 权重 ===
-                    r = torch.norm(lidar_point - center)
-                    w_sim = torch.exp(-alpha * r)
-                    w_dist = 1.0 - w_sim
+                        # === Step3: 权重 ===
+                        r = torch.norm(lidar_point - center)
+                        w_sim = torch.exp(-alpha * r)
+                        w_dist = 1.0 - w_sim
 
-                    # === Step4: 融合 ===
-                    fused_scores = w_sim * sim_scores_logit + w_dist * dist_sim
-                    
-                    fused_matrix[i, torch.tensor(topk_img_global, device=device)] = fused_scores
+                        # === Step4: 融合 ===
+                        fused_scores = w_sim * sim_scores_logit + w_dist * dist_sim
+                        
+                        fused_matrix_cam[radar_idx_in_valid, torch.tensor(cam_topk_global_idx, device=device)] = fused_scores
 
                 # # --- 匈牙利算法求解最优匹配 ---
                 # row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
                 # --- KM 算法最大权匹配 ---
-                row_ind, col_ind =self.km_max_weight_match(fused_matrix.detach().cpu().numpy())
+                    cam_matches = self.km_multi_match(fused_matrix_cam, lidar_idx, topN=1)
+                    # 存储当前相机的匹配结果（含融合得分，用于后续筛top2）
+                    for lid_original_idx, img_idx_list in cam_matches.items():
+                        if len(img_idx_list) == 0:
+                            continue  # 无匹配结果跳过
+                        img_global_idx = img_idx_list[0]
+                        # 获取该匹配的融合得分（从fused_matrix_cam中提取）
+                        radar_idx_in_valid = torch.where(lidar_idx == lid_original_idx)[0].item()
+                        fused_score = fused_matrix_cam[radar_idx_in_valid, img_global_idx].item()
+                        # 添加到雷达-相机匹配列表（避免重复添加同一相机的结果）
+                        radar_cam_matches[lid_original_idx].append((img_global_idx, fused_score))
 
-                # --- 保存匹配结果 ---
-                for r_i, c_j in zip(row_ind, col_ind):
-                    lidar_qidx = lidar_idx[r_i].item()
-                    img_qidx = c_j    # 转回全局索引
-                    lidar2img_dict[lidar_qidx] = [img_qidx]   # ✅ 必须用 list
+                    # 更新全局起始索引，进入下一个相机
+                    start = end
+                # === 新增: 保存每个匹配的图像 query 对应的 points ===
+                # 2. 对每个雷达query，从6个相机的匹配结果中筛选top2（按融合得分降序）
+                for lid_original_idx, cam_match_list in radar_cam_matches.items():
+                    if len(cam_match_list) == 0:
+                        continue  # 无任何相机匹配结果，跳过
+                    # 按融合得分降序排序
+                    cam_match_list_sorted = sorted(cam_match_list, key=lambda x: x[1], reverse=True)
+                    # 取前2个结果（若不足2个则取全部）
+                    top2_matches = [img_idx for img_idx, score in cam_match_list_sorted[:2]]
+                    lidar2img_dict[lid_original_idx] = top2_matches
+
+                    # 3. 保存匹配图像的参考点（原逻辑保留）
+                    img_points = points[num_query_pts + torch.tensor(top2_matches, device=device)]
+                    lidar2img_points_dict[lid_original_idx] = img_points  # [2, 3]（或1个，若不足2个）
+                
+                 # 初始化雷达topk变量（避免后续未定义错误）
+                lidar_topk_scores = torch.tensor([], device=device)
+                lidar_topk_indices = torch.tensor([], device=device, dtype=torch.long)
             else:
+                 # 无有效雷达query时，初始化变量避免报错
                 lidar_topk_scores, lidar_topk_indices = None, None
+                lidar2img_points_dict = {}
 
             # --- 图像 → 图像 (Q: 过滤后图像, K: 全部图像，不含自身) ---
             if img_idx.numel() > 0:
@@ -930,6 +983,131 @@ class MV2DFusionHead(AnchorFreeHead):
                 topk_img_indices = torch.unique(topk_img_indices) # 去重
             else:
                 topk_img_indices = torch.tensor([], device=device, dtype=torch.long)
+        # if self.enable_matching and not self.training:
+        #     from scipy.optimize import linear_sum_assignment
+        #     # 取最后一层解码器输出: [num_query, D]
+        #     last_dec = outs_dec[-1][0, :self.num_query]   # [num_query, D]
+        #     device = last_dec.device
+        #     Q_total, D = last_dec.shape
+        #     points=reference_points[-1][0]
+        #     # QK 投影参数
+        #     attn_mod = self.transformer.decoder.layers[-1].attentions[0].attn
+        #     W = attn_mod.in_proj_weight.to(device)      # [3D, D]
+        #     b = attn_mod.in_proj_bias.to(device)        # [3D]
+        #     W_q, W_k = W[0:D, :], W[D:2*D, :]
+        #     b_q, b_k = b[0:D], b[D:2*D]
+        #     scale = torch.sqrt(torch.tensor(D, dtype=torch.float, device=device))
+
+        #     # --- Step1: 计算所有图像 query 的 K（不过滤） ---
+        #     # K_img_all = torch.matmul(last_dec[num_query_pts:], W_k.T) + b_k   # [N_img_all, D]
+        #     K_img_all=last_dec[num_query_pts:]
+        #     # K_img_all = F.normalize(K_img_all, dim=-1)
+        #     # === 新增: 基于 dets 分数过滤 ===
+        #     valid_img_mask = []
+        #     for cam_id, cam_dets in enumerate(dets):  # dets[cam_id]: [n, 6]
+        #         scores = cam_dets[:, 4]  # 得到分数
+        #         keep = scores >= 0.0     # [n]
+        #         valid_img_mask.append(keep)
+        #     # 拼接成全局 mask
+        #     valid_img_mask = torch.cat(valid_img_mask, dim=0)  
+        #     # --- Step2: 过滤有效 query，并计算 Q ---
+        #     valid_mask = tgt_query_mask[0, :self.num_query]       # [num_query]
+        #     feats = last_dec[valid_mask]                          # [N_valid, D]
+        #     idx_map = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)  # 有效 query 原始下标 [N_valid]
+
+        #     # Q_all = torch.matmul(feats, W_q.T) + b_q
+        #     Q_all=feats
+        #     # Q_all = F.normalize(Q_all, dim=-1)
+
+        #     # --- Step3: 区分雷达 / 图像 ---
+        #     lidar_mask = idx_map < num_query_pts
+        #     img_mask   = idx_map >= num_query_pts
+        #     lidar_idx  = idx_map[lidar_mask]   # 有效雷达 query 原始索引
+        #     img_idx    = idx_map[img_mask]     # 有效图像 query 原始索引
+
+        #     # --- 雷达 → 图像 (Q: 过滤后雷达, K: 全部图像) ---
+        #     alpha = 12.0  # 可调节超参数
+        #     center = torch.zeros(points.shape[-1], device=device)
+        #     lidar2img_dict = {}
+        #     lidar2img_dist_dict = {}
+        #     lidar2img_fusedscore = {}
+        #     if lidar_idx.numel() > 0:
+        #         Q_lidar = Q_all[lidar_mask]                       # [Nr, D]
+        #         attn_lidar2img = torch.matmul(Q_lidar, K_img_all.T)    # [Nr, N_img_all]
+        #         # 屏蔽无效的 img query
+        #         attn_lidar2img[:, ~valid_img_mask] = -1e9
+        #         probs = F.softmax(attn_lidar2img, dim=-1)
+        #         k = 20 if K_img_all.shape[0] >= 20 else 1
+        #         lidar_topk_scores, lidar_topk_indices  = torch.topk(probs, k=k, dim=1)
+        #         # --- 构造 cost_matrix [Nr, N_img_all] ---
+        #         Nr = lidar_idx.shape[0]
+        #         Nimg = K_img_all.shape[0]
+        #         fused_matrix = torch.full((Nr, Nimg), -1e6, device=device)
+        #         for i, q_idx in enumerate(lidar_idx.tolist()):
+        #             topk_img_global = lidar_topk_indices[i].tolist()  # 候选全局索引
+        #             sim_scores = lidar_topk_scores[i]                 # 相似度得分 [k]
+                    
+        #             lidar_point = points[q_idx]
+        #             img_points = points[num_query_pts +torch.tensor(topk_img_global, device=device)]
+        #             dists = torch.norm(lidar_point.unsqueeze(0) - img_points, dim=-1)  # [k]
+                    
+        #             # === Step1: logit变换相似度 ===
+        #             sim_scores_logit = torch.log(sim_scores / (1 - sim_scores + 1e-9))
+        #             # sim_scores_logit= (sim_scores_logit - sim_scores_logit.min()) / (sim_scores_logit.max() - sim_scores_logit.min() + 1e-9)
+        #             # === Step2: 距离归一化 ===
+        #             dist_norm = (dists - dists.min()) / (dists.max() - dists.min() + 1e-9)
+        #             dist_sim = 1 - dist_norm  
+
+        #             # === Step3: 权重 ===
+        #             r = torch.norm(lidar_point - center)
+        #             w_sim = torch.exp(-alpha * r)
+        #             w_dist = 1.0 - w_sim
+
+        #             # === Step4: 融合 ===
+        #             fused_scores = w_sim * sim_scores_logit + w_dist * dist_sim
+                    
+        #             fused_matrix[i, torch.tensor(topk_img_global, device=device)] = fused_scores
+
+        #         # # --- 匈牙利算法求解最优匹配 ---
+        #         # row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
+        #         # --- KM 算法最大权匹配 ---
+        #         lidar2img_dict = self.km_multi_match(fused_matrix, lidar_idx, topN=2)
+        #         # === 新增: 保存每个匹配的图像 query 对应的 points ===
+        #         lidar2img_points_dict = {}
+        #         for lq, img_q_list in lidar2img_dict.items():
+        #             img_points = points[num_query_pts + torch.tensor(img_q_list, device=device)]
+        #             lidar2img_points_dict[lq] = img_points  # [topN, 3]，对应每个图像 query 的参考点
+
+        #     else:
+        #         lidar_topk_scores, lidar_topk_indices = None, None
+
+        #     # --- 图像 → 图像 (Q: 过滤后图像, K: 全部图像，不含自身) ---
+        #     if img_idx.numel() > 0:
+        #         Q_img = Q_all[img_mask]               # [Ni_valid, D]
+        #         attn_img2img = torch.matmul(Q_img, K_img_all.T) / scale   # [Ni_valid, N_img_all]
+
+        #         # 去掉 Q 对应的自身 K
+        #         for i, q_idx in enumerate(img_idx):
+        #             attn_img2img[i, q_idx - num_query_pts] = -float("inf")
+
+        #         probs = F.softmax(attn_img2img, dim=-1)
+
+        #         k = 2 if K_img_all.shape[0] >= 2 else 1
+        #         img_topk_scores, img_topk_indices = torch.topk(probs, k=k, dim=1)
+                
+        #     else:
+        #         img_topk_scores, img_topk_indices = None, None
+            
+        #     topk_indices_list = []
+        #     if lidar_topk_indices is not None:
+        #         topk_indices_list.append(lidar_topk_indices.flatten())
+        #     if img_topk_indices is not None:
+        #         topk_indices_list.append(img_topk_indices.flatten())
+        #     if len(topk_indices_list) > 0:
+        #         topk_img_indices = torch.cat(topk_indices_list)       # 拼接
+        #         topk_img_indices = torch.unique(topk_img_indices) # 去重
+        #     else:
+        #         topk_img_indices = torch.tensor([], device=device, dtype=torch.long)
         
         # ========== 实验内容结束：2D和3D匹配 =============
         
@@ -955,9 +1133,50 @@ class MV2DFusionHead(AnchorFreeHead):
             'topk_img_indices': topk_img_indices, # 新增：去重后的 topk 图像 query 索引
             'lidar2img_dict':lidar2img_dict,
             'tgt_query_mask':tgt_query_mask[0][:num_query_pts],
+            'lidar2img_points_dict':lidar2img_points_dict,
         }
         return outs
     import numpy as np
+    def km_multi_match(self, fused_matrix, lidar_idx, topN=5):
+        """
+        基于 KM 算法的 1 对 N 匹配
+        Args:
+            fused_matrix: torch.Tensor, shape [Nr, Nimg]，每个雷达 query 与所有 img query 的匹配得分
+            lidar_idx: torch.Tensor, 原始雷达 query 索引
+            topN: 每个雷达 query 要保留几个匹配
+        Returns:
+            lidar2img_dict: dict {lidar_qidx: [img_qidx1, img_qidx2, ..., img_qidxN]}
+        """
+        Nr, Nimg = fused_matrix.shape
+        device = fused_matrix.device
+
+        # === Step1: 扩展矩阵 ===
+        # 每个雷达 query 复制 topN 份
+        fused_matrix_expanded = fused_matrix.repeat_interleave(topN, dim=0)  # [Nr*topN, Nimg]
+
+        # === Step2: KM 算法 ===
+        row_ind, col_ind = self.km_max_weight_match(fused_matrix_expanded.detach().cpu().numpy())
+
+        # === Step3: 聚合结果 ===
+        lidar2img_dict = {lidar_idx[i].item(): [] for i in range(Nr)}
+        for r_i, c_j in zip(row_ind, col_ind):
+            original_lidar = r_i // topN   # 映射回原始雷达 query
+            lidar_qidx = lidar_idx[original_lidar].item()
+            if c_j not in lidar2img_dict[lidar_qidx]:  # 避免重复
+                lidar2img_dict[lidar_qidx].append(c_j)
+
+        # === Step4: 如果有不足 topN 的，补上本地 TopK ===
+        for i, q_idx in enumerate(lidar_idx.tolist()):
+            if len(lidar2img_dict[q_idx]) < topN:
+                # 从 fused_matrix 的行中取 TopK
+                extra_candidates = torch.topk(fused_matrix[i], k=topN).indices.tolist()
+                for c in extra_candidates:
+                    if c not in lidar2img_dict[q_idx]:
+                        lidar2img_dict[q_idx].append(c)
+                    if len(lidar2img_dict[q_idx]) >= topN:
+                        break
+
+        return lidar2img_dict
 
     def km_max_weight_match(self,weight_matrix: np.ndarray):
         """
