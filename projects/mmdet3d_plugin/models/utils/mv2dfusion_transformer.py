@@ -338,7 +338,7 @@ class MV2DFusionTransformerDecoder(BaseModule):
                 interm_q = query
 
             # get new dyn_q_probs   动态更新查询概率分布（dyn_q_probs）
-            # #通过当前层的概率分支，计算概率更新量（logits残差）
+            # #通过当前层的概率分支，计算概率更新量（logits残差），只针对对image目标
             dyn_q_logits_res = dyn_q_prob_branch[i](query.transpose(0, 1)[dyn_q_mask])
             dyn_q_logits = dyn_q_logits + dyn_q_logits_res# 累加更新对数概率（logits累加 = 概率乘法，避免数值下溢）
             dyn_q_probs = dyn_q_logits.softmax(-1)# 将logits转回概率分布（softmax在候选坐标维度归一化，确保概率和为1）
@@ -545,7 +545,7 @@ class MixedCrossAttention(BaseModule):
         lidar2img = lidar2img_mat[..., :3, :].flatten(-2)# 提取投影矩阵的前3行（3x4，用于3D→2D投影），并展平为向量
         cam_embed = self.cam_embed(lidar2img)  # B, N, C
         feat_pos_img = (instance_feature + anchor_embed).unsqueeze(2) + cam_embed.unsqueeze(1)## 融合实例特征、锚点嵌入和相机嵌入，得到带位置和相机信息的特征
-        weights = self.weights_fc_img(feat_pos_img).reshape(bs, num_anchor, -1, self.num_groups).softmax(dim=-2)
+        weights = self.weights_fc_img(feat_pos_img).reshape(bs, num_anchor, -1, self.num_groups).softmax(dim=-2) #每个anchor在相机*fpn特征层*13个关键点空间维度上做权重分配
         weights = weights.reshape(bs, num_anchor, self.num_cams, -1, self.num_groups).permute(0, 2, 1, 4,
                                                                                               3).contiguous()
         return weights.flatten(end_dim=1)
@@ -584,7 +584,7 @@ class MixedCrossAttention(BaseModule):
 
         output = output.reshape(bs, self.num_cams, num_anchor, -1)
 
-        return output.sum(1)
+        return output.sum(1)  # 多相机3D感知核心设计： 同一个anchor在不同相机视角下的信息特征融合
 
 
 @ATTENTION.register_module()
